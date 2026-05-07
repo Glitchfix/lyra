@@ -570,6 +570,30 @@ class WANDiffusionModel(ImaginaireModel):
                     module.set_scale(adapter_name, get_module_weight(weight, module_name))
         log.info(f"Set weights: {weights}, and activate adapters: {adapter_names}")
 
+    def merge_active_lora_adapters(self, adapter_names=None):
+        if BaseTunerLayer is None:
+            return 0
+        if isinstance(adapter_names, str):
+            adapter_names = [adapter_names]
+
+        merged_count = 0
+        for _, module in self.net.named_modules():
+            if isinstance(module, BaseTunerLayer) and not module.merged:
+                if hasattr(module, "get_base_layer") and hasattr(module, "lora_bias"):
+                    base_layer = module.get_base_layer()
+                    if hasattr(base_layer, "bias") and base_layer.bias is None:
+                        for adapter_name in adapter_names or module.active_adapters:
+                            if module.lora_bias.get(adapter_name, False):
+                                lora_bias = module.lora_B[adapter_name].bias
+                                if lora_bias is not None:
+                                    base_layer.bias = torch.nn.Parameter(torch.zeros_like(lora_bias))
+                                    break
+                module.merge(safe_merge=False, adapter_names=adapter_names)
+                merged_count += 1
+
+        log.info(f"Merged LoRA adapters into {merged_count} modules for inference")
+        return merged_count
+
     def training_step(
         self, data_batch: dict[str, torch.Tensor], iteration: int
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:

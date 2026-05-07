@@ -39,6 +39,10 @@ import torch.nn.functional as F
 from lyra_2._ext.imaginaire.utils import log, misc
 from lyra_2._ext.imaginaire.visualize.video import save_img_or_video
 from lyra_2._src.inference.lyra2_ar_inference import (
+    _offload_diffusion_to_cpu,
+    _offload_module_to_cpu,
+    _restore_diffusion_to_gpu,
+    _restore_module_to_device,
     save_output,
     safe_to,
     run_lyra2_sample,
@@ -51,6 +55,22 @@ from lyra_2._src.utils.model_loader import load_model_from_checkpoint
 
 torch.enable_grad(False)
 torch.backends.cudnn.enabled = False
+
+
+def _get_t5_embedding_memory_safe(caption, args, desired_device, desired_dtype, model):
+    from lyra_2._src.inference.get_t5_emb import get_umt5_embedding, get_umt5_embedding_offloaded
+
+    if args.offload_when_prompt:
+        _offload_diffusion_to_cpu(model, True)
+    try:
+        if args.offload_when_prompt:
+            emb = get_umt5_embedding_offloaded(caption, device=desired_device)
+        else:
+            emb = get_umt5_embedding(caption, device=desired_device)
+    finally:
+        if args.offload_when_prompt:
+            _restore_diffusion_to_gpu(model, True)
+    return emb.to(dtype=desired_dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +163,11 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--lora_weights", type=float, default=None, nargs="+")
     parser.add_argument("--offload", action="store_true")
     parser.add_argument("--offload_when_prompt", action="store_true")
+    parser.add_argument(
+        "--low_vram",
+        action="store_true",
+        help="Enable conservative memory defaults: model/VAE offload, prompt offload, DA3 offload, and smaller warp chunks.",
+    )
     parser.add_argument("--debug", action="store_true")
 
     # Depth backend
@@ -170,6 +195,11 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--disable_cache_update", action="store_true")
     parser.add_argument("--multiview_ids", type=int, nargs="+", default=None)
     parser.add_argument("--offload_da3_diffusion", action="store_true")
+    parser.add_argument(
+        "--save_warp_video",
+        action="store_true",
+        help="Save/debug warped conditioning videos. Disabled by default to reduce memory and host transfers.",
+    )
 
     return parser.parse_args()
 
@@ -203,8 +233,24 @@ def _apply_dmd_defaults(args):
     )
 
 
+def _apply_low_vram_defaults(args):
+    if not getattr(args, "low_vram", False):
+        return
+    args.offload = True
+    args.offload_when_prompt = True
+    args.offload_da3_diffusion = True
+    if args.warp_chunk_size is None:
+        args.warp_chunk_size = 2
+    log.info(
+        "[low_vram] Enabled: offload=True, offload_when_prompt=True, "
+        f"offload_da3_diffusion=True, warp_chunk_size={args.warp_chunk_size}",
+        rank0_only=True,
+    )
+
+
 if __name__ == "__main__":
     args = parse_arguments()
+    _apply_low_vram_defaults(args)
     _apply_dmd_defaults(args)
 
     if args.debug:
@@ -251,7 +297,11 @@ if __name__ == "__main__":
             lora_name = model.load_lora_weights(lora_path)
             lora_names.append(lora_name)
         model.set_weights_and_activate_adapters(lora_names, args.lora_weights)
-        if hasattr(model, "net") and hasattr(model.net, "enable_selective_checkpoint"):
+        if args.low_vram and hasattr(model, "merge_active_lora_adapters"):
+            model.merge_active_lora_adapters(lora_names)
+        if args.low_vram:
+            log.info("Skipping selective checkpoint wrappers for low-VRAM inference", rank0_only=True)
+        elif hasattr(model, "net") and hasattr(model.net, "enable_selective_checkpoint"):
             model.net.enable_selective_checkpoint(model.net.sac_config, model.net.blocks)
 
     desired_dtype = model.tensor_kwargs.get("dtype", None)
@@ -277,7 +327,8 @@ if __name__ == "__main__":
 
     # ---- Load DA3 model ----
     from lyra_2._src.inference.depth_utils import load_da3_model
-    da3_device = model.tensor_kwargs.get("device", "cuda" if torch.cuda.is_available() else "cpu")
+    da3_target_device = model.tensor_kwargs.get("device", "cuda" if torch.cuda.is_available() else "cpu")
+    da3_device = "cpu" if args.offload_da3_diffusion else da3_target_device
     da3_model = load_da3_model(
         da3_model_name=args.da3_model_name,
         da3_model_path_custom=args.da3_model_path_custom,
@@ -340,11 +391,19 @@ if __name__ == "__main__":
 
         # ---- Depth & intrinsics for the first frame (via DA3) ----
         log.info("Running DA3 single-image depth...", rank0_only=True)
-        image_chw01, depth_hw, _K_33_da3, mask_hw = _da3_infer_depth_intrinsics_single(
-            da3_model=da3_model,
-            img_rgb_uint8=rgb_t,
-            target_hw=(target_h, target_w),
-        )
+        if args.offload_da3_diffusion:
+            _offload_diffusion_to_cpu(model, True)
+            _restore_module_to_device(da3_model, True, da3_target_device)
+        try:
+            image_chw01, depth_hw, _K_33_da3, mask_hw = _da3_infer_depth_intrinsics_single(
+                da3_model=da3_model,
+                img_rgb_uint8=rgb_t,
+                target_hw=(target_h, target_w),
+            )
+        finally:
+            if args.offload_da3_diffusion:
+                _offload_module_to_cpu(da3_model, True)
+                _restore_diffusion_to_gpu(model, True)
         H, W = image_chw01.shape[-2:]
 
         # ---- Optionally align DA3 depth to MoGe scale ----
@@ -352,16 +411,25 @@ if __name__ == "__main__":
             log.info("Aligning DA3 depth to MoGe scale...", rank0_only=True)
             from lyra_2._src.inference.depth_utils import moge_infer_depth_intrinsics
 
-            moge_model.to(desired_device)
-            with torch.nn.attention.sdpa_kernel(
-                [torch.nn.attention.SDPBackend.MATH]
-            ):
-                _, moge_depth_hw, _, moge_mask_hw = moge_infer_depth_intrinsics(
-                    moge_model,
-                    rgb_t,
-                    depth_pred_hw=(target_h, target_w),
-                    target_hw=(target_h, target_w),
-                )
+            if args.offload_da3_diffusion:
+                _offload_diffusion_to_cpu(model, True)
+            try:
+                moge_model.to(desired_device)
+                with torch.nn.attention.sdpa_kernel(
+                    [torch.nn.attention.SDPBackend.MATH]
+                ):
+                    _, moge_depth_hw, _, moge_mask_hw = moge_infer_depth_intrinsics(
+                        moge_model,
+                        rgb_t,
+                        depth_pred_hw=(target_h, target_w),
+                        target_hw=(target_h, target_w),
+                    )
+            finally:
+                moge_model.cpu()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                if args.offload_da3_diffusion:
+                    _restore_diffusion_to_gpu(model, True)
 
             da3_d = depth_hw.to(moge_depth_hw.device)
             da3_m = mask_hw.to(moge_mask_hw.device)
@@ -389,7 +457,6 @@ if __name__ == "__main__":
             else:
                 log.warning("Not enough overlapping valid pixels for scale alignment.", rank0_only=True)
 
-            moge_model.cpu()
             del moge_depth_hw, moge_mask_hw, da3_d, da3_m
             torch.cuda.empty_cache()
             gc.collect()
@@ -397,7 +464,6 @@ if __name__ == "__main__":
         img_bchw = image_chw01.to(device=desired_device) * 2.0 - 1.0
 
         # ---- Load captions ----
-        from lyra_2._src.inference.get_t5_emb import get_umt5_embedding, get_umt5_embedding_offloaded
         neg_t5 = misc.to(negative_prompt_data["t5_text_embeddings"], **model.tensor_kwargs)
 
         captions_file = None
@@ -427,10 +493,7 @@ if __name__ == "__main__":
                     cap = captions_dict[str(ck)]
                     if args.prompt_suffix:
                         cap = cap.rstrip() + " " + args.prompt_suffix
-                    if args.offload_when_prompt:
-                        emb = get_umt5_embedding_offloaded(cap, device=desired_device).to(dtype=desired_dtype)
-                    else:
-                        emb = get_umt5_embedding(cap, device=desired_device).to(dtype=desired_dtype)
+                    emb = _get_t5_embedding_memory_safe(cap, args, desired_device, desired_dtype, model)
                     if emb.dim() == 3:
                         emb = emb[0]
                     S, D = emb.shape
@@ -472,10 +535,7 @@ if __name__ == "__main__":
                 )
             if args.prompt_suffix:
                 caption = caption.rstrip() + " " + args.prompt_suffix
-            if args.offload_when_prompt:
-                t5 = get_umt5_embedding_offloaded(caption, device=desired_device).to(dtype=desired_dtype)
-            else:
-                t5 = get_umt5_embedding(caption, device=desired_device).to(dtype=desired_dtype)
+            t5 = _get_t5_embedding_memory_safe(caption, args, desired_device, desired_dtype, model)
             if t5.dim() == 2:
                 t5 = t5.unsqueeze(0)
             elif t5.dim() == 3 and t5.shape[0] != 1:

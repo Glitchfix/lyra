@@ -134,18 +134,70 @@ class Lyra2AttentionBlock(nn.Module):
             else:
                 torch.nn.init.trunc_normal_(self.buffer_encoder.weight, std=std, a=-3 * std, b=3 * std)
 
+    def _forward_ffn(self, x):
+        if torch.is_grad_enabled() or not x.is_cuda or x.ndim != 3:
+            return self.ffn(x)
+
+        max_hidden_elements = 64_000_000
+        hidden_elements = int(x.shape[0]) * int(x.shape[1]) * int(self.ffn_dim)
+        if hidden_elements <= max_hidden_elements:
+            return self.ffn(x)
+
+        chunk_tokens = max(1, max_hidden_elements // max(1, int(x.shape[0]) * int(self.ffn_dim)))
+        out = x.new_empty(x.shape[0], x.shape[1], self.dim)
+        for start in range(0, x.shape[1], chunk_tokens):
+            end = min(start + chunk_tokens, x.shape[1])
+            out[:, start:end] = self.ffn(x[:, start:end])
+        return out
+
     @staticmethod
     def _sincos_embed(x: torch.Tensor, multires: int) -> torch.Tensor:
         if multires <= 0:
             return x
+        multires = int(multires)
+        in_dim = x.shape[-1]
         x_float = x.float()
-        embeds = []
+        out = x.new_empty(*x.shape[:-1], in_dim * 2 * multires)
+        offset = 0
         for i in range(int(multires)):
             freq = (2.0 ** i) * math.pi
-            embeds.append(torch.sin(x_float * freq))
-            embeds.append(torch.cos(x_float * freq))
-        out = torch.cat(embeds, dim=-1)
-        return out.type_as(x)
+            angles = x_float * freq
+            out[..., offset : offset + in_dim] = torch.sin(angles).to(dtype=x.dtype)
+            offset += in_dim
+            out[..., offset : offset + in_dim] = torch.cos(angles).to(dtype=x.dtype)
+            offset += in_dim
+        return out
+
+    @staticmethod
+    def _module_out_features(module: nn.Module) -> int:
+        if hasattr(module, "out_features"):
+            return int(module.out_features)
+        for layer in reversed(list(module.children())):
+            try:
+                return Lyra2AttentionBlock._module_out_features(layer)
+            except TypeError:
+                continue
+        raise TypeError(f"Cannot infer output features for {type(module)}")
+
+    def _encode_sincos_buffer(self, buffer: torch.Tensor) -> torch.Tensor:
+        assert self.buffer_encoder is not None
+        if torch.is_grad_enabled():
+            return self.buffer_encoder(self._sincos_embed(buffer, self.buffer_sincos_multires))
+
+        in_dim = buffer.shape[-1]
+        flat_buffer = buffer.reshape(-1, in_dim)
+        out_features = self._module_out_features(self.buffer_encoder)
+        flat_out = buffer.new_empty(flat_buffer.shape[0], out_features)
+
+        max_embed_elements = 64_000_000
+        embed_dim = in_dim * 2 * int(self.buffer_sincos_multires)
+        chunk_tokens = max(1, min(flat_buffer.shape[0], max_embed_elements // max(1, embed_dim)))
+
+        for start in range(0, flat_buffer.shape[0], chunk_tokens):
+            end = min(start + chunk_tokens, flat_buffer.shape[0])
+            buffer_emb = self._sincos_embed(flat_buffer[start:end], self.buffer_sincos_multires)
+            flat_out[start:end] = self.buffer_encoder(buffer_emb)
+        return flat_out.reshape(*buffer.shape[:-1], out_features)
 
     def forward(
         self,
@@ -178,8 +230,9 @@ class Lyra2AttentionBlock(nn.Module):
                 buffer = buffer[..., :-1]
             assert self.buffer_encoder is not None
             if self.buffer_sincos_multires > 0:
-                buffer = self._sincos_embed(buffer, self.buffer_sincos_multires)
-            buf_emb = self.buffer_encoder(buffer)
+                buf_emb = self._encode_sincos_buffer(buffer)
+            else:
+                buf_emb = self.buffer_encoder(buffer)
             if self.inject_kq_only:
                 buf_emb = buf_emb * validity
         else:
@@ -190,22 +243,43 @@ class Lyra2AttentionBlock(nn.Module):
         y = (self.norm1(x).float() * (1 + e[1]) + e[0]).type_as(x)
 
         if self.inject_kq_only:
-            kq_bias = cam_emb + buf_emb
+            if isinstance(cam_emb, torch.Tensor) and isinstance(buf_emb, torch.Tensor) and not torch.is_grad_enabled():
+                kq_bias = cam_emb
+                kq_bias.add_(buf_emb)
+            else:
+                kq_bias = cam_emb + buf_emb
             if isinstance(kq_bias, (int, float)) and kq_bias == 0:
                 kq_bias = None
+            if not torch.is_grad_enabled():
+                del cam_emb, buf_emb
             y = self.self_attn(y, seq_lens, video_size, freqs, kq_bias=kq_bias)
         else:
             y = self.self_attn(y + cam_emb + buf_emb, seq_lens, video_size, freqs)
 
-        with amp.autocast("cuda", dtype=torch.float32):
-            x = x + y * e[2].type_as(x)
+        if not torch.is_grad_enabled():
+            y.mul_(e[2].type_as(y))
+            x.add_(y)
+            del y
+        else:
+            with amp.autocast("cuda", dtype=torch.float32):
+                x = x + y * e[2].type_as(x)
 
         # cross-attn + ffn (same as base)
         def cross_attn_ffn(x, context, context_lens, e):
-            x = x + self.cross_attn(self.norm3(x), context, context_lens)
-            y = self.ffn((self.norm2(x).float() * (1 + e[4]) + e[3]).type_as(x))
-            with amp.autocast("cuda", dtype=torch.float32):
-                x = x + y * e[5].type_as(x)
+            y = self.cross_attn(self.norm3(x), context, context_lens)
+            if not torch.is_grad_enabled():
+                x.add_(y)
+                del y
+            else:
+                x = x + y
+            y = self._forward_ffn((self.norm2(x).float() * (1 + e[4]) + e[3]).type_as(x))
+            if not torch.is_grad_enabled():
+                y.mul_(e[5].type_as(y))
+                x.add_(y)
+                del y
+            else:
+                with amp.autocast("cuda", dtype=torch.float32):
+                    x = x + y * e[5].type_as(x)
             return x
 
         x = cross_attn_ffn(x, context, context_lens, e)
@@ -935,6 +1009,10 @@ class Lyra2WanModel(WeightTrainingStat):
             camera=camera_5d,
             buffer_B_C_T_H_W=y_buffer_B_C_T_H_W,
         )
+        if not torch.is_grad_enabled():
+            del x_B_C_T_H_W, camera_5d, y_buffer_B_C_T_H_W
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         # Context Parallel after Lyra2 patchify: split tokens along L if enabled
         cp_enabled = getattr(self, "is_context_parallel_enabled", False)
@@ -969,6 +1047,10 @@ class Lyra2WanModel(WeightTrainingStat):
         if frame_cond_crossattn_emb_B_L_D is not None:
             context_clip = self.img_emb(frame_cond_crossattn_emb_B_L_D)
             context_B_L_D = torch.concat([context_clip, context_B_L_D], dim=1)
+            if not torch.is_grad_enabled():
+                del context_clip, frame_cond_crossattn_emb_B_L_D
+        if not torch.is_grad_enabled():
+            del crossattn_emb
 
         assert x_tokens.shape[0] == 1
         seq_lens = torch.tensor([x_tokens.size(1)] * x_tokens.size(0), dtype=torch.long, device=x_tokens.device)

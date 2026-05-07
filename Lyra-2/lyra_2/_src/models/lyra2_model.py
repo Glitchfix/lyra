@@ -282,6 +282,14 @@ class Lyra2Model(WANDiffusionModel):
                 net = fully_shard(net, mesh=self.fsdp_device_mesh, reshard_after_forward=True, **fsdp_kwargs)
 
             with misc.timer("meta to cuda and broadcast model states"):
+                if not config.keep_original_net_dtype:
+                    net = net.to(dtype=self.tensor_kwargs["dtype"])
+                for aux_name in ("tokenizer", "conditioner"):
+                    aux_module = getattr(self, aux_name, None)
+                    if aux_module is not None and hasattr(aux_module, "cpu"):
+                        aux_module.cpu()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 net.to_empty(device="cuda")
                 net.init_weights()
 
@@ -679,10 +687,13 @@ class Lyra2Model(WANDiffusionModel):
           => x0 = x_t - sigma_t * pred
         """
         original_dtype = flow_pred.dtype
-        flow_pred, xt, sigmas, timesteps = map(
-            lambda x: x.double().to(flow_pred.device),
-            [flow_pred, xt, scheduler.sigmas, scheduler.timesteps],
-        )
+        device = flow_pred.device
+        compute_dtype = torch.float32 if original_dtype in (torch.float16, torch.bfloat16) else original_dtype
+        flow_pred = flow_pred.to(device=device, dtype=compute_dtype)
+        xt = xt.to(device=device, dtype=compute_dtype)
+        sigmas = scheduler.sigmas.to(device=device, dtype=compute_dtype)
+        timesteps = scheduler.timesteps.to(device=device, dtype=compute_dtype)
+        timestep = timestep.to(device=device, dtype=compute_dtype)
         timestep_id = torch.argmin(
             (timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1
         )
@@ -717,11 +728,13 @@ class Lyra2Model(WANDiffusionModel):
             )
             self.dmd_scheduler.set_timesteps(num_train_timestep, training=True)
             self.dmd_scheduler.timesteps = self.dmd_scheduler.timesteps.to(history_latents.device)
-            self.denoising_step_list = torch.LongTensor(denoising_step_list)
+            self.denoising_step_list = torch.tensor(
+                denoising_step_list, device=history_latents.device, dtype=torch.long
+            )
             timesteps = torch.cat(
                 (
-                    self.dmd_scheduler.timesteps.cpu(),
-                    torch.tensor([0], dtype=torch.float32),
+                    self.dmd_scheduler.timesteps,
+                    self.dmd_scheduler.timesteps.new_tensor([0]),
                 )
             )
             self.denoising_step_list = timesteps[num_train_timestep - self.denoising_step_list]
@@ -761,11 +774,10 @@ class Lyra2Model(WANDiffusionModel):
         if "padding_mask" in kwargs and kwargs["padding_mask"] is not None:
             data_batch["padding_mask"] = kwargs["padding_mask"]
 
-        # 3) Build condition / uncondition (uncondition unused in DMD path but required by conditioner API)
+        # 3) Build only the conditioned branch. DMD is distilled for conditional-only sampling.
         is_image_batch = False
-        condition, uncondition = self.conditioner.get_condition_with_negative_prompt(data_batch)
+        condition = self.conditioner.get_condition(data_batch)
         condition = condition.edit_data_type(DataType.IMAGE if is_image_batch else DataType.VIDEO)
-        uncondition = uncondition.edit_data_type(DataType.IMAGE if is_image_batch else DataType.VIDEO)
 
         # 4) Init latents: keep history clean, random noise on generated region
         init_latents = torch.zeros(
@@ -788,7 +800,6 @@ class Lyra2Model(WANDiffusionModel):
         if cp_group is not None:
             init_latents = broadcast(init_latents.contiguous(), cp_group)
             condition = condition.broadcast(cp_group)
-            uncondition = uncondition.broadcast(cp_group)
         else:
             assert not getattr(self.net, "is_context_parallel_enabled", False), (
                 "context parallel should be disabled if parallel_state is not initialized"
@@ -815,7 +826,7 @@ class Lyra2Model(WANDiffusionModel):
         seed_g = torch.Generator(device=self.tensor_kwargs["device"])
         seed_g.manual_seed(seed if seed is not None else 0)
 
-        denoising_step_list = self.denoising_step_list
+        denoising_step_list = self.denoising_step_list.to(self.tensor_kwargs["device"])
         exit_flag = len(denoising_step_list) - 1
 
         latents = init_latents
@@ -2846,5 +2857,3 @@ class Sparse3DCache:
 
         top_ids_reversed = top_ids[::-1]
         return [(self._latent_indices[i], self._frame_ids[i]) for i in top_ids_reversed]
-
-

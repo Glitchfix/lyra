@@ -301,6 +301,20 @@ def _restore_diffusion_to_gpu(model, enable_offload: bool):
         model.net.to(model.tensor_kwargs.get("device", "cuda"))
 
 
+def _offload_module_to_cpu(module, enable_offload: bool):
+    """Move an auxiliary module to CPU when low-VRAM offload is enabled."""
+    if enable_offload and module is not None and hasattr(module, "to"):
+        module.to("cpu")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+def _restore_module_to_device(module, enable_offload: bool, device):
+    """Move an auxiliary module back to the requested device when needed."""
+    if enable_offload and module is not None and hasattr(module, "to"):
+        module.to(device)
+
+
 def safe_to(obj, device=None, dtype=None, skip_keys: set | None = None):
     """Recursively move tensors to device/dtype while skipping dtype conversion for specific keys.
 
@@ -427,6 +441,7 @@ class Lyra2InferencePipeline:
         self.use_image_spatial = bool(getattr(cfg, "spatial_memory_use_image", False))
         self.merge_history_buffers = False
         self.num_retrieval_views: int = int(getattr(args, "num_retrieval_views", 1))
+        self.save_warp_video: bool = bool(getattr(args, "save_warp_video", False))
         self.warp_video_collect: List[torch.Tensor] = []
         self.vipe_input_dump_dir = vipe_input_dump_dir
         self.vipe_input_dump_prefix = vipe_input_dump_prefix
@@ -479,6 +494,10 @@ class Lyra2InferencePipeline:
                         device=da3_device,
                     )
                     self.local_da3_model.eval()
+                _offload_module_to_cpu(
+                    self.local_da3_model,
+                    bool(getattr(args, "offload_da3_diffusion", False)),
+                )
             else:
                 raise ValueError(f"Unsupported depth_backend='{self.depth_backend}' for this inference script.")
 
@@ -742,10 +761,11 @@ class Lyra2InferencePipeline:
         # Keep original skip behavior from the previous implementation.
         spatial_cache_skip_last_n = 0
 
-        # Collect warped pixels for visualization if pose conditioning is enabled.
+        # Collect warped pixels for visualization only when requested.
         prev_collect = bool(getattr(self.model, "_collect_return_condition_state", False))
+        _offload_diffusion_to_cpu(self.model, self.args.offload)
         try:
-            self.model._collect_return_condition_state = True
+            self.model._collect_return_condition_state = self.save_warp_video
             latents_full, cond_latent, _mask, buffer_cond_latents = self.model._prepare_lyra2_inputs(
             history_full=history_full,
             gen_cond=gen_cond_dummy,
@@ -764,12 +784,15 @@ class Lyra2InferencePipeline:
         gc.collect()
         torch.cuda.empty_cache()
         warp_pixels = getattr(self.model, "_latest_condition_state_pixels", None)
-        if self.use_pose and warp_pixels is not None:
+        if self.save_warp_video and self.use_pose and warp_pixels is not None:
             if isinstance(warp_pixels, torch.Tensor) and warp_pixels.dim() == 5:
                 if int(warp_pixels.shape[1]) > 3:
                     warp_pixels = warp_pixels[:, :3]
             self.warp_video_collect.append(warp_pixels.detach().float().cpu())
-        history_window = latents_full[:, :, : -T_new_lat]
+        history_window = latents_full[:, :, : -T_new_lat].contiguous()
+        del latents_full, history_full, video_all, gen_cond_dummy, buffer_depth
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         self._restore_model_to_gpu()
         pos_text, neg_text = self._prepare_text_embeddings(t5_text_embeddings, neg_t5_text_embeddings)
@@ -828,6 +851,7 @@ class Lyra2InferencePipeline:
                 dim=2,
             )
 
+        _offload_diffusion_to_cpu(self.model, self.args.offload)
         with self.vae_wrap.context:
             px_cast = new_generated_frames.to(self.vae_wrap.dtype) if not self.vae_wrap.is_amp else new_generated_frames
             feats_gen, enc_cache_out = self.model.vae_encode_with_cache(
@@ -839,6 +863,7 @@ class Lyra2InferencePipeline:
             )
             self.enc_feat_cache[:] = enc_cache_out
             gen_chunk_reencoded = self.model._encoder_feats_to_normalized_latents(feats_gen).to(self.history_latents.dtype)
+        self._restore_model_to_gpu()
         if self.args.offload:
             self.history_latents = torch.cat(
                 [self.history_latents, gen_chunk_reencoded.to(self.history_latents.dtype).cpu()],
@@ -873,6 +898,11 @@ class Lyra2InferencePipeline:
             offload_da3 = bool(getattr(self.args, "offload_da3_diffusion", False))
             if offload_da3:
                 _offload_diffusion_to_cpu(self.model, True)
+                _restore_module_to_device(
+                    self.local_da3_model,
+                    True,
+                    self.model.tensor_kwargs.get("device", "cuda" if torch.cuda.is_available() else "cpu"),
+                )
             try:
                 da3_out = _predict_da3_depth_window(
                     da3_model=self.local_da3_model,
@@ -893,6 +923,7 @@ class Lyra2InferencePipeline:
                 )
             finally:
                 if offload_da3:
+                    _offload_module_to_cpu(self.local_da3_model, True)
                     _restore_diffusion_to_gpu(self.model, True)
             da3_frames: List[int] = da3_out["frame_indices"]
             da3_pred = da3_out["prediction"]
@@ -1184,7 +1215,7 @@ class Lyra2InferencePipeline:
     def build_outputs(self, da3_gs_export_stem, log_prefix):
         video = self.history_frames[:, :, self.start_index:]
         warp_video = None
-        if self.use_pose and len(self.warp_video_collect) > 0:
+        if self.save_warp_video and self.use_pose and len(self.warp_video_collect) > 0:
             warp_video = torch.cat(self.warp_video_collect, dim=2)
             first_frame = video[:, :, :1]
             warp_video = torch.cat([first_frame.cpu(), warp_video], dim=2)
@@ -1267,7 +1298,7 @@ def run_lyra2_sample(
     tokens_needed = (num_frames - 1 + pipeline.frames_per_latent - 1) // pipeline.frames_per_latent
     num_iters = (tokens_needed + pipeline.tokens_per_step - 1) // pipeline.tokens_per_step
 
-    with torch.no_grad():
+    with torch.inference_mode():
         log.info(log_prefix, rank0_only=True)
         for ar_idx in tqdm.tqdm(range(num_iters)):
             start_px_idx = 1 + ar_idx * model.framepack_num_new_video_frames

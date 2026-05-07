@@ -222,12 +222,14 @@ def rope_apply(x, video_size: VideoSize, freqs):
     # Make sure the sequence length matches the grid size
     assert seq_len == curr_seq_len, "Sequence length must be equal to T*H*W"
 
+    rotary_dtype = x.dtype if not torch.is_grad_enabled() and x.is_cuda else torch.float32
     freqs = freqs.view(seq_len, head_dim // 2)
-    cos = torch.cos(freqs).to(torch.float32)
-    sin = torch.sin(freqs).to(torch.float32)
+    cos = torch.cos(freqs).to(rotary_dtype)
+    sin = torch.sin(freqs).to(rotary_dtype)
 
     # Apply the rotation
-    rotated = flash_apply_rotary_emb(x.to(torch.float32), cos, sin, interleaved=True, inplace=False)
+    rotary_x = x if x.dtype == rotary_dtype else x.to(rotary_dtype)
+    rotated = flash_apply_rotary_emb(rotary_x, cos, sin, interleaved=True, inplace=False)
 
     return rotated.to(x.dtype)
 
@@ -247,6 +249,16 @@ class WanRMSNorm(nn.Module):
         Args:
             x(Tensor): Shape [B, L, C]
         """
+        if not torch.is_grad_enabled() and x.is_cuda and x.numel() > 32_000_000:
+            out = torch.empty_like(x)
+            flat_x = x.reshape(-1, x.shape[-1])
+            flat_out = out.reshape(-1, x.shape[-1])
+            chunk_rows = max(1, min(flat_x.shape[0], 32_000_000 // max(1, x.shape[-1])))
+            for start in range(0, flat_x.shape[0], chunk_rows):
+                end = min(start + chunk_rows, flat_x.shape[0])
+                normed = self._norm(flat_x[start:end].float()).type_as(x)
+                flat_out[start:end] = normed * self.weight
+            return out
         return self._norm(x.float()).type_as(x) * self.weight
 
     def _norm(self, x):
@@ -333,18 +345,21 @@ class WanSelfAttention(nn.Module):
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
-        # query, key, value function
         x_kq = x if kq_bias is None else x + kq_bias
+        if kq_bias is not None and not torch.is_grad_enabled():
+            del kq_bias
 
-        def qkv_fn(x, x_kq):
-            q = self.norm_q(self.q(x_kq)).view(b, s, n, d)
-            k = self.norm_k(self.k(x_kq)).view(b, s, n, d)
-            v = self.v(x).view(b, s, n, d)
-            return q, k, v
+        q = self.norm_q(self.q(x_kq)).view(b, s, n, d)
+        k = self.norm_k(self.k(x_kq)).view(b, s, n, d)
+        if x_kq is not x and not torch.is_grad_enabled():
+            del x_kq
+        v = self.v(x).view(b, s, n, d)
 
-        q, k, v = qkv_fn(x, x_kq)
-
-        x = self.attn_op(rope_apply(q, video_size, freqs), rope_apply(k, video_size, freqs), v, video_size)
+        q = rope_apply(q, video_size, freqs)
+        k = rope_apply(k, video_size, freqs)
+        x = self.attn_op(q, k, v, video_size)
+        if not torch.is_grad_enabled():
+            del q, k, v
 
         # output
         x = x.flatten(2)
@@ -372,6 +387,8 @@ class WanT2VCrossAttention(WanSelfAttention):
 
         # compute attention
         x = self.attn_op(q, k, v, None)
+        if not torch.is_grad_enabled():
+            del q, k, v
         # output
         x = x.flatten(2)
         x = self.o(x)
@@ -419,20 +436,36 @@ class WanI2VCrossAttention(WanSelfAttention):
         context = context[:, image_context_length:]
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
-        # compute query, key, value
         q = self.norm_q(self.q(x)).view(b, -1, n, d)
-        k = self.norm_k(self.k(context)).view(b, -1, n, d)
-        v = self.v(context).view(b, -1, n, d)
-        k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
-        v_img = self.v_img(context_img).view(b, -1, n, d)
-        img_x = self.attn_op_image(q, k_img, v_img)
-        # compute attention
-        x = self.attn_op(q, k, v)
+
+        if not torch.is_grad_enabled():
+            k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
+            v_img = self.v_img(context_img).view(b, -1, n, d)
+            del context_img
+            img_x = self.attn_op_image(q, k_img, v_img)
+            del k_img, v_img
+
+            k = self.norm_k(self.k(context)).view(b, -1, n, d)
+            v = self.v(context).view(b, -1, n, d)
+            del context
+            x = self.attn_op(q, k, v)
+            del q, k, v
+        else:
+            k = self.norm_k(self.k(context)).view(b, -1, n, d)
+            v = self.v(context).view(b, -1, n, d)
+            k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
+            v_img = self.v_img(context_img).view(b, -1, n, d)
+            img_x = self.attn_op_image(q, k_img, v_img)
+            x = self.attn_op(q, k, v)
 
         # output
         x = x.flatten(2)
         img_x = img_x.flatten(2)
-        x = x + img_x
+        if not torch.is_grad_enabled():
+            x.add_(img_x)
+            del img_x
+        else:
+            x = x + img_x
         x = self.o(x)
         return x
 
@@ -489,6 +522,22 @@ class WanAttentionBlock(nn.Module):
         std = 1.0 / math.sqrt(self.dim)
         torch.nn.init.trunc_normal_(self.modulation, std=std)
 
+    def _forward_ffn(self, x):
+        if torch.is_grad_enabled() or not x.is_cuda or x.ndim != 3:
+            return self.ffn(x)
+
+        max_hidden_elements = 64_000_000
+        hidden_elements = int(x.shape[0]) * int(x.shape[1]) * int(self.ffn_dim)
+        if hidden_elements <= max_hidden_elements:
+            return self.ffn(x)
+
+        chunk_tokens = max(1, max_hidden_elements // max(1, int(x.shape[0]) * int(self.ffn_dim)))
+        out = x.new_empty(x.shape[0], x.shape[1], self.dim)
+        for start in range(0, x.shape[1], chunk_tokens):
+            end = min(start + chunk_tokens, x.shape[1])
+            out[:, start:end] = self.ffn(x[:, start:end])
+        return out
+
     def forward(
         self,
         x,
@@ -514,15 +563,30 @@ class WanAttentionBlock(nn.Module):
 
         # self-attention
         y = self.self_attn((self.norm1(x).float() * (1 + e[1]) + e[0]).type_as(x), seq_lens, video_size, freqs)
-        with amp.autocast("cuda", dtype=torch.float32):
-            x = x + y * e[2].type_as(x)
+        if not torch.is_grad_enabled():
+            y.mul_(e[2].type_as(y))
+            x.add_(y)
+            del y
+        else:
+            with amp.autocast("cuda", dtype=torch.float32):
+                x = x + y * e[2].type_as(x)
 
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e):
-            x = x + self.cross_attn(self.norm3(x), context, context_lens)
-            y = self.ffn((self.norm2(x).float() * (1 + e[4]) + e[3]).type_as(x))
-            with amp.autocast("cuda", dtype=torch.float32):
-                x = x + y * e[5].type_as(x)
+            y = self.cross_attn(self.norm3(x), context, context_lens)
+            if not torch.is_grad_enabled():
+                x.add_(y)
+                del y
+            else:
+                x = x + y
+            y = self._forward_ffn((self.norm2(x).float() * (1 + e[4]) + e[3]).type_as(x))
+            if not torch.is_grad_enabled():
+                y.mul_(e[5].type_as(y))
+                x.add_(y)
+                del y
+            else:
+                with amp.autocast("cuda", dtype=torch.float32):
+                    x = x + y * e[5].type_as(x)
             return x
 
         x = cross_attn_ffn(x, context, context_lens, e)

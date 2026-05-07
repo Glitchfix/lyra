@@ -447,6 +447,20 @@ class GeneralConditioner(nn.Module, ABC):
         un_condition: Any = self(data_batch, override_dropout_rate=dropout_rates)
         return condition, un_condition
 
+    def get_condition(
+        self,
+        data_batch: Dict,
+    ) -> Any:
+        """Build only the fully conditioned branch.
+
+        This is useful for inference paths that do not need classifier-free
+        guidance, such as DMD-distilled sampling.
+        """
+        cond_dropout_rates = {}
+        for emb_name in self.embedders.keys():
+            cond_dropout_rates[emb_name] = 0.0
+        return self(data_batch, override_dropout_rate=cond_dropout_rates)
+
     def get_condition_with_negative_prompt(
         self,
         data_batch: Dict,
@@ -472,5 +486,4 @@ class GeneralConditioner(nn.Module, ABC):
         un_condition: Any = self(data_batch_neg_prompt, override_dropout_rate=uncond_dropout_rates)
 
         return condition, un_condition
-
 
