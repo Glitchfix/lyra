@@ -29,7 +29,10 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import math
 import os
+import select
+import sys
 
 import cv2
 import numpy as np
@@ -82,6 +85,7 @@ def load_trajectory(
     num_frames: int,
     target_hw: tuple[int, int] | None = None,
     pose_scale: float = 1.0,
+    extend_mode: str = "error",
 ):
     """Load camera trajectory from an .npz file.
 
@@ -96,8 +100,25 @@ def load_trajectory(
     Returns the first *num_frames* entries as torch tensors.
     """
     data = np.load(path)
-    w2c = torch.from_numpy(data["w2c"][:num_frames].astype(np.float32))
-    intrinsics = torch.from_numpy(data["intrinsics"][:num_frames].astype(np.float32))
+    w2c_np = data["w2c"].astype(np.float32)
+    intr_np = data["intrinsics"].astype(np.float32)
+    available = int(w2c_np.shape[0])
+    if num_frames <= available:
+        indices = np.arange(num_frames)
+    elif extend_mode == "loop":
+        indices = np.arange(num_frames) % available
+    elif extend_mode == "repeat_last":
+        indices = np.concatenate(
+            [np.arange(available), np.full(num_frames - available, available - 1, dtype=np.int64)]
+        )
+    else:
+        raise ValueError(
+            f"Trajectory has {available} frames but {num_frames} were requested. "
+            "Use --trajectory_extend loop or repeat_last for continuous generation."
+        )
+
+    w2c = torch.from_numpy(w2c_np[indices])
+    intrinsics = torch.from_numpy(intr_np[indices])
 
     if pose_scale != 1.0:
         w2c[:, :3, 3] *= pose_scale
@@ -116,6 +137,687 @@ def load_trajectory(
     return w2c, intrinsics
 
 
+def _depth_to_sparse_points(
+    depth_hw: torch.Tensor,
+    K_33: torch.Tensor,
+    mask_hw: torch.Tensor,
+    *,
+    stride: int,
+    max_points: int,
+    depth_percentile: float,
+) -> np.ndarray:
+    depth = depth_hw.detach().to(dtype=torch.float32, device="cpu").numpy()
+    mask = mask_hw.detach().to(dtype=torch.float32, device="cpu").numpy() > 0.5
+    valid = np.isfinite(depth) & (depth > 1e-4) & (depth < 1e4) & mask
+    if not np.any(valid):
+        raise ValueError("Cannot build WoS trajectory: no valid depth pixels.")
+
+    cap = np.percentile(depth[valid], float(depth_percentile))
+    valid &= depth <= cap
+
+    H, W = depth.shape
+    step = max(1, int(stride))
+    yy, xx = np.mgrid[0:H:step, 0:W:step]
+    yy = yy.reshape(-1)
+    xx = xx.reshape(-1)
+    keep = valid[yy, xx]
+    yy = yy[keep]
+    xx = xx[keep]
+    if yy.size == 0:
+        yy, xx = np.nonzero(valid)
+
+    if int(max_points) > 0 and yy.size > int(max_points):
+        sel = np.linspace(0, yy.size - 1, int(max_points), dtype=np.int64)
+        yy = yy[sel]
+        xx = xx[sel]
+
+    K = K_33.detach().to(dtype=torch.float32, device="cpu").numpy()
+    z = depth[yy, xx].astype(np.float32)
+    x = ((xx.astype(np.float32) - K[0, 2]) / max(float(K[0, 0]), 1e-6)) * z
+    y = ((yy.astype(np.float32) - K[1, 2]) / max(float(K[1, 1]), 1e-6)) * z
+    return np.stack([x, y, z], axis=1).astype(np.float32)
+
+
+def _center_depth_from_depth(depth_hw: torch.Tensor, mask_hw: torch.Tensor) -> float:
+    depth = depth_hw.detach().to(dtype=torch.float32, device="cpu").numpy()
+    mask = mask_hw.detach().to(dtype=torch.float32, device="cpu").numpy() > 0.5
+    H, W = depth.shape
+    y0, y1 = int(0.30 * H), int(0.70 * H)
+    x0, x1 = int(0.30 * W), int(0.70 * W)
+    center = depth[y0:y1, x0:x1]
+    center_mask = mask[y0:y1, x0:x1]
+    valid = center[np.isfinite(center) & (center > 1e-4) & (center < 1e4) & center_mask]
+    if valid.size < 16:
+        valid = depth[np.isfinite(depth) & (depth > 1e-4) & (depth < 1e4) & mask]
+    if valid.size == 0:
+        raise ValueError("Cannot build WoS trajectory: no valid center depth.")
+    return float(np.median(valid))
+
+
+def _nearest_point_distance(pos: np.ndarray, points: np.ndarray) -> tuple[float, np.ndarray]:
+    diff = points - pos[None, :]
+    d2 = np.einsum("ij,ij->i", diff, diff)
+    idx = int(np.argmin(d2))
+    return float(math.sqrt(max(float(d2[idx]), 0.0))), points[idx]
+
+
+def _wos_adjust_path(
+    desired: np.ndarray,
+    points: np.ndarray,
+    *,
+    clearance: float,
+    step_fraction: float,
+    max_steps_per_frame: int = 64,
+) -> np.ndarray:
+    planned = np.empty_like(desired, dtype=np.float32)
+    planned[0] = desired[0]
+    step_fraction = float(np.clip(step_fraction, 0.1, 1.0))
+    clearance = max(float(clearance), 1e-5)
+
+    for i in range(1, desired.shape[0] - 1):
+        cur = planned[i - 1].astype(np.float32).copy()
+        goal = desired[i].astype(np.float32)
+        for _ in range(max_steps_per_frame):
+            to_goal = goal - cur
+            dist_to_goal = float(np.linalg.norm(to_goal))
+            if dist_to_goal < 1e-5:
+                cur = goal
+                break
+            nn_dist, nearest = _nearest_point_distance(cur, points)
+            free_radius = nn_dist - clearance
+            if free_radius <= 0.0:
+                away = cur - nearest
+                away_norm = float(np.linalg.norm(away))
+                if away_norm < 1e-6:
+                    away = -to_goal
+                    away_norm = float(np.linalg.norm(away))
+                cur = cur + away / max(away_norm, 1e-6) * (clearance - nn_dist + 1e-4)
+                continue
+            step = min(dist_to_goal, max(free_radius * step_fraction, clearance * 0.05))
+            cur = cur + to_goal / dist_to_goal * step
+
+        nn_dist, nearest = _nearest_point_distance(cur, points)
+        if nn_dist < clearance:
+            away = cur - nearest
+            away_norm = float(np.linalg.norm(away))
+            if away_norm > 1e-6:
+                cur = cur + away / away_norm * (clearance - nn_dist + 1e-4)
+        planned[i] = cur
+
+    planned[-1] = desired[-1]
+    for _ in range(2):
+        smoothed = planned.copy()
+        smoothed[1:-1] = 0.25 * planned[:-2] + 0.5 * planned[1:-1] + 0.25 * planned[2:]
+        planned = smoothed
+        planned[0] = desired[0]
+        planned[-1] = desired[-1]
+    return planned
+
+
+def _look_at_w2c_np(camera_pos: np.ndarray, target: np.ndarray) -> np.ndarray:
+    forward = target - camera_pos
+    forward = forward / max(float(np.linalg.norm(forward)), 1e-8)
+    up_hint = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    if abs(float(np.dot(up_hint, forward))) > 0.98:
+        up_hint = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    right = np.cross(up_hint, forward)
+    right = right / max(float(np.linalg.norm(right)), 1e-8)
+    up = np.cross(forward, right)
+    up = up / max(float(np.linalg.norm(up)), 1e-8)
+
+    w2c = np.eye(4, dtype=np.float32)
+    w2c[0, :3] = right
+    w2c[1, :3] = up
+    w2c[2, :3] = forward
+    w2c[:3, 3] = -w2c[:3, :3] @ camera_pos.astype(np.float32)
+    return w2c
+
+
+def _short_angle_delta(target: float, current: float) -> float:
+    return (float(target) - float(current) + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def _json_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _json_vec3(value) -> list[float] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        return None
+    out = [_json_float(item, float("nan")) for item in value]
+    if not np.isfinite(np.asarray(out, dtype=np.float32)).all():
+        return None
+    return out
+
+
+def _command_history_record(chunk_index: int, cmd: dict) -> dict:
+    record: dict[str, object] = {"chunk": float(chunk_index)}
+    for key, value in cmd.items():
+        if key == "trail" and isinstance(value, list):
+            record["trail_samples"] = float(len(value))
+        elif isinstance(value, (list, tuple, np.ndarray)):
+            record[key] = [_json_float(item) for item in value]
+        elif isinstance(value, (int, float, np.integer, np.floating)):
+            record[key] = float(value)
+        elif value is not None:
+            record[key] = str(value)
+    return record
+
+
+def _free_roam_trail_from_data(data: dict) -> list[dict]:
+    raw = data.get("trail")
+    if not isinstance(raw, list):
+        return []
+    trail = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        pos = _json_vec3(item.get("position"))
+        if pos is None:
+            continue
+        trail.append(
+            {
+                "sequence": _json_float(item.get("sequence"), -1.0),
+                "position": pos,
+                "yaw_degrees": _json_float(item.get("yaw_degrees"), 0.0),
+                "pitch_degrees": _json_float(item.get("pitch_degrees"), 0.0),
+            }
+        )
+    trail.sort(key=lambda item: float(item["sequence"]))
+    return trail
+
+
+def _interp_path(values: np.ndarray, total: int) -> np.ndarray:
+    if values.shape[0] <= 1:
+        return np.repeat(values[:1], int(total), axis=0)
+    src = np.linspace(0.0, 1.0, values.shape[0], dtype=np.float32)
+    dst = np.linspace(0.0, 1.0, int(total), dtype=np.float32)
+    out = np.empty((int(total), values.shape[1]), dtype=np.float32)
+    for dim in range(values.shape[1]):
+        out[:, dim] = np.interp(dst, src, values[:, dim]).astype(np.float32)
+    return out
+
+
+def build_wos_360_trajectory(
+    depth_hw: torch.Tensor,
+    K_33: torch.Tensor,
+    mask_hw: torch.Tensor,
+    *,
+    num_frames: int,
+    loops: float,
+    radius_scale: float,
+    vertical_amp: float,
+    clearance_ratio: float,
+    step_fraction: float,
+    depth_stride: int,
+    max_points: int,
+    depth_percentile: float,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    if num_frames < 2:
+        raise ValueError("WoS 360 trajectory requires at least two frames.")
+
+    center_depth = _center_depth_from_depth(depth_hw, mask_hw)
+    points = _depth_to_sparse_points(
+        depth_hw,
+        K_33,
+        mask_hw,
+        stride=depth_stride,
+        max_points=max_points,
+        depth_percentile=depth_percentile,
+    )
+
+    target = np.array([0.0, 0.0, center_depth], dtype=np.float32)
+    theta = np.linspace(0.0, 2.0 * math.pi * float(loops), int(num_frames), endpoint=True, dtype=np.float32)
+    frac = np.linspace(0.0, 1.0, int(num_frames), endpoint=True, dtype=np.float32)
+
+    radius_base = center_depth
+    radius = radius_base * (1.0 + (float(radius_scale) - 1.0) * (np.sin(math.pi * frac) ** 2))
+    desired = np.zeros((int(num_frames), 3), dtype=np.float32)
+    desired[:, 0] = radius * np.sin(theta)
+    desired[:, 1] = float(vertical_amp) * center_depth * np.sin(2.0 * theta)
+    desired[:, 2] = center_depth - radius * np.cos(theta)
+    desired[0] = 0.0
+    desired[-1] = 0.0
+
+    clearance = max(float(clearance_ratio) * center_depth, 1e-4)
+    planned = _wos_adjust_path(
+        desired,
+        points,
+        clearance=clearance,
+        step_fraction=step_fraction,
+    )
+    planned[0] = 0.0
+    planned[-1] = 0.0
+
+    w2c_np = np.stack([_look_at_w2c_np(p, target) for p in planned], axis=0)
+    w2c_np[0] = np.eye(4, dtype=np.float32)
+    w2c_np[-1] = np.eye(4, dtype=np.float32)
+    Ks = K_33.detach().to(dtype=torch.float32, device="cpu").unsqueeze(0).repeat(int(num_frames), 1, 1)
+    stats = {
+        "center_depth": float(center_depth),
+        "clearance": float(clearance),
+        "num_points": float(points.shape[0]),
+        "loops": float(loops),
+    }
+    return torch.from_numpy(w2c_np.astype(np.float32)), Ks, stats
+
+
+def build_wos_lookaround_trajectory(
+    depth_hw: torch.Tensor,
+    K_33: torch.Tensor,
+    mask_hw: torch.Tensor,
+    *,
+    num_frames: int,
+    yaw_degrees: float,
+    pitch_degrees: float,
+    pitch_cycles: float,
+    translation_ratio: float,
+    clearance_ratio: float,
+    step_fraction: float,
+    depth_stride: int,
+    max_points: int,
+    depth_percentile: float,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    if num_frames < 2:
+        raise ValueError("WoS look-around trajectory requires at least two frames.")
+
+    center_depth = _center_depth_from_depth(depth_hw, mask_hw)
+    points = _depth_to_sparse_points(
+        depth_hw,
+        K_33,
+        mask_hw,
+        stride=depth_stride,
+        max_points=max_points,
+        depth_percentile=depth_percentile,
+    )
+
+    frac = np.linspace(0.0, 1.0, int(num_frames), endpoint=True, dtype=np.float32)
+    # Smooth start/end reduces the early-frame snap that tends to destabilize generation.
+    eased = frac * frac * (3.0 - 2.0 * frac)
+    yaw = np.deg2rad(float(yaw_degrees)) * eased
+    pitch_amp = np.deg2rad(float(pitch_degrees))
+    pitch = pitch_amp * np.sin(2.0 * math.pi * float(pitch_cycles) * eased)
+
+    drift = max(float(translation_ratio), 0.0) * center_depth
+    desired = np.zeros((int(num_frames), 3), dtype=np.float32)
+    desired[:, 0] = drift * np.sin(2.0 * math.pi * eased)
+    desired[:, 1] = 0.5 * drift * np.sin(4.0 * math.pi * eased)
+    desired[:, 2] = 0.25 * drift * (1.0 - np.cos(2.0 * math.pi * eased))
+    desired[0] = 0.0
+    desired[-1] = 0.0
+
+    clearance = max(float(clearance_ratio) * center_depth, 1e-4)
+    planned = _wos_adjust_path(
+        desired,
+        points,
+        clearance=clearance,
+        step_fraction=step_fraction,
+    )
+    planned[0] = 0.0
+    planned[-1] = 0.0
+
+    w2c_list = []
+    for p, y, pt in zip(planned, yaw, pitch):
+        forward = np.array(
+            [
+                math.sin(float(y)) * math.cos(float(pt)),
+                math.sin(float(pt)),
+                math.cos(float(y)) * math.cos(float(pt)),
+            ],
+            dtype=np.float32,
+        )
+        target = p + forward * center_depth
+        w2c_list.append(_look_at_w2c_np(p, target))
+
+    w2c_np = np.stack(w2c_list, axis=0).astype(np.float32)
+    w2c_np[0] = np.eye(4, dtype=np.float32)
+    w2c_np[-1] = np.eye(4, dtype=np.float32)
+    Ks = K_33.detach().to(dtype=torch.float32, device="cpu").unsqueeze(0).repeat(int(num_frames), 1, 1)
+    drift_norm = np.linalg.norm(planned, axis=1)
+    stats = {
+        "center_depth": float(center_depth),
+        "clearance": float(clearance),
+        "num_points": float(points.shape[0]),
+        "yaw_degrees": float(yaw_degrees),
+        "pitch_degrees": float(pitch_degrees),
+        "max_drift": float(drift_norm.max() if drift_norm.size else 0.0),
+    }
+    return torch.from_numpy(w2c_np), Ks, stats
+
+
+class WosWalkTrajectoryStream:
+    """Chunk-wise WoS trajectory planner for long walking-style generation.
+
+    The planner emits only the next AR chunk of poses. It keeps a small sparse
+    obstacle map and can refresh it from Lyra's spatial cache after each chunk.
+    """
+
+    def __init__(
+        self,
+        depth_hw: torch.Tensor,
+        K_33: torch.Tensor,
+        mask_hw: torch.Tensor,
+        *,
+        seed: int,
+        speed_ratio: float,
+        turn_degrees_per_chunk: float,
+        random_turn_degrees: float,
+        strafe_ratio: float,
+        bob_ratio: float,
+        pitch_degrees: float,
+        vertical_ratio: float,
+        free_roam_max_chunk_ratio: float,
+        clearance_ratio: float,
+        step_fraction: float,
+        depth_stride: int,
+        max_points: int,
+        depth_percentile: float,
+        control_mode: str,
+        control_path: str | None,
+        map_update_max_points: int,
+    ) -> None:
+        self.K = K_33.detach().to(dtype=torch.float32, device="cpu").numpy().astype(np.float32)
+        self.K_torch = K_33.detach().to(dtype=torch.float32, device="cpu")
+        self.center_depth = _center_depth_from_depth(depth_hw, mask_hw)
+        self.seed_points = _depth_to_sparse_points(
+            depth_hw,
+            K_33,
+            mask_hw,
+            stride=depth_stride,
+            max_points=max_points,
+            depth_percentile=depth_percentile,
+        )
+        self.points = self.seed_points.copy()
+        self.clearance = max(float(clearance_ratio) * self.center_depth, 1e-4)
+        self.step_fraction = float(step_fraction)
+        self.speed = max(float(speed_ratio), 0.0) * self.center_depth
+        self.vertical_speed = max(float(vertical_ratio), 0.0) * self.center_depth
+        self.free_roam_max_delta = max(float(free_roam_max_chunk_ratio), 0.0) * self.center_depth
+        self.max_turn = math.radians(abs(float(turn_degrees_per_chunk)))
+        self.random_turn = math.radians(abs(float(random_turn_degrees)))
+        self.strafe = max(float(strafe_ratio), 0.0) * self.center_depth
+        self.bob = max(float(bob_ratio), 0.0) * self.center_depth
+        self.pitch_amp = math.radians(abs(float(pitch_degrees)))
+        self.control_mode = str(control_mode)
+        self.control_path = control_path
+        self.map_update_max_points = int(map_update_max_points)
+        self.rng = np.random.default_rng(int(seed))
+
+        self.position = np.zeros(3, dtype=np.float32)
+        self.yaw = 0.0
+        self.pitch = 0.0
+        self.turn_velocity = 0.0
+        self.frame_index = 0
+        self.command = {"forward": 1.0, "strafe": 0.0, "vertical": 0.0, "turn": 0.0, "pitch": 0.0}
+        if self.control_mode == "free_roam":
+            self.command["forward"] = 0.0
+        self.free_roam_last_sequence = -1.0
+        self.generated_w2c: list[np.ndarray] = [np.eye(4, dtype=np.float32)]
+        self.generated_K: list[np.ndarray] = [self.K.copy()]
+        self.generated_positions: list[np.ndarray] = [self.position.copy()]
+        self.command_history: list[dict[str, object]] = []
+
+    def _command_from_file(self) -> dict[str, float] | None:
+        if not self.control_path or not os.path.isfile(self.control_path):
+            return None
+        try:
+            with open(self.control_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return None
+        if isinstance(data, list):
+            data = data[-1] if data else {}
+        if not isinstance(data, dict):
+            return None
+        cmd = {
+            "forward": _json_float(data.get("forward", self.command["forward"]), self.command["forward"]),
+            "strafe": _json_float(data.get("strafe", self.command["strafe"]), self.command["strafe"]),
+            "vertical": _json_float(
+                data.get("vertical", self.command.get("vertical", 0.0)),
+                self.command.get("vertical", 0.0),
+            ),
+            "turn": _json_float(data.get("turn", data.get("turn_degrees", self.command["turn"])), self.command["turn"]),
+            "pitch": _json_float(data.get("pitch", data.get("pitch_degrees", self.command["pitch"])), self.command["pitch"]),
+        }
+        target_position = _json_vec3(data.get("target_position", data.get("position")))
+        if target_position is not None:
+            cmd["target_position"] = target_position
+        if "yaw_degrees" in data or "yaw" in data:
+            cmd["target_yaw"] = _json_float(data.get("yaw_degrees", data.get("yaw")), math.degrees(self.yaw))
+        if "pitch_degrees" in data or "absolute_pitch" in data:
+            cmd["target_pitch"] = _json_float(
+                data.get("pitch_degrees", data.get("absolute_pitch")),
+                math.degrees(self.pitch),
+            )
+        if "sequence" in data:
+            cmd["sequence"] = _json_float(data.get("sequence"), 0.0)
+        trail = _free_roam_trail_from_data(data)
+        if trail:
+            cmd["trail"] = trail
+        if "mode" in data:
+            cmd["mode"] = str(data.get("mode"))
+        return cmd
+
+    def _command_from_keyboard(self) -> dict[str, float] | None:
+        if not sys.stdin or not hasattr(sys.stdin, "fileno"):
+            return None
+        try:
+            ready, _, _ = select.select([sys.stdin], [], [], 0.0)
+        except (OSError, ValueError):
+            return None
+        if not ready:
+            return None
+        line = sys.stdin.readline().strip().lower()
+        if not line:
+            return None
+        if line in {"random", "auto"}:
+            self.control_mode = "random"
+            return None
+        cmd = {"forward": 0.0, "strafe": 0.0, "vertical": 0.0, "turn": 0.0, "pitch": 0.0}
+        if "w" in line:
+            cmd["forward"] += 1.0
+        if "s" in line:
+            cmd["forward"] -= 0.5
+        if "a" in line:
+            cmd["strafe"] -= 1.0
+        if "d" in line:
+            cmd["strafe"] += 1.0
+        if "z" in line:
+            cmd["vertical"] -= 1.0
+        if "c" in line:
+            cmd["vertical"] += 1.0
+        if "q" in line:
+            cmd["turn"] -= math.degrees(self.max_turn)
+        if "e" in line:
+            cmd["turn"] += math.degrees(self.max_turn)
+        if "r" in line:
+            cmd["pitch"] += math.degrees(self.pitch_amp)
+        if "f" in line:
+            cmd["pitch"] -= math.degrees(self.pitch_amp)
+        if "x" in line:
+            cmd = {"forward": 0.0, "strafe": 0.0, "vertical": 0.0, "turn": 0.0, "pitch": 0.0}
+        return cmd
+
+    def _next_command(self) -> dict[str, float]:
+        if self.control_mode in {"file", "free_roam"}:
+            cmd = self._command_from_file()
+            if cmd is not None:
+                self.command = cmd
+        elif self.control_mode == "keyboard":
+            cmd = self._command_from_keyboard()
+            if cmd is not None:
+                self.command = cmd
+        else:
+            noise = float(self.rng.normal(0.0, self.random_turn))
+            self.turn_velocity = float(np.clip(0.85 * self.turn_velocity + 0.15 * noise, -self.max_turn, self.max_turn))
+            self.command = {
+                "forward": 1.0,
+                "strafe": float(self.rng.normal(0.0, 0.20)),
+                "vertical": 0.0,
+                "turn": math.degrees(self.turn_velocity),
+                "pitch": float(self.rng.normal(0.0, math.degrees(self.pitch_amp) * 0.25)),
+            }
+        return dict(self.command)
+
+    def next_chunk(self, num_frames: int, *, chunk_index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        cmd = self._next_command()
+        self.command_history.append(_command_history_record(chunk_index, cmd))
+
+        total = int(num_frames) + 2
+        frac = np.linspace(0.0, 1.0, total, endpoint=True, dtype=np.float32)
+
+        desired = np.empty((total, 3), dtype=np.float32)
+        desired[0] = self.position
+        trail = cmd.get("trail")
+        new_trail = []
+        if isinstance(trail, list) and trail:
+            for item in trail:
+                if not isinstance(item, dict):
+                    continue
+                seq = _json_float(item.get("sequence"), -1.0)
+                pos = _json_vec3(item.get("position"))
+                if pos is None or seq <= self.free_roam_last_sequence:
+                    continue
+                new_trail.append(
+                    {
+                        "sequence": seq,
+                        "position": pos,
+                        "yaw_degrees": _json_float(item.get("yaw_degrees"), math.degrees(self.yaw)),
+                        "pitch_degrees": _json_float(item.get("pitch_degrees"), math.degrees(self.pitch)),
+                    }
+                )
+            new_trail.sort(key=lambda item: float(item["sequence"]))
+            # On startup, avoid replaying minutes of stale controller history.
+            if self.free_roam_last_sequence < 0.0 and len(new_trail) > 32:
+                new_trail = new_trail[-32:]
+
+        if new_trail:
+            self.free_roam_last_sequence = max(float(item["sequence"]) for item in new_trail)
+            positions = np.asarray([self.position] + [item["position"] for item in new_trail], dtype=np.float32)
+            final_delta = positions[-1] - self.position
+            final_delta_norm = float(np.linalg.norm(final_delta))
+            max_delta = self.free_roam_max_delta
+            if max_delta > 0.0 and final_delta_norm > max_delta:
+                positions = self.position[None, :] + (positions - self.position[None, :]) * (max_delta / final_delta_norm)
+            desired = _interp_path(positions, total)
+            if self.bob > 0.0:
+                bob = self.bob * np.sin(2.0 * math.pi * (self.frame_index + np.arange(total)) / 24.0)
+                desired[:, 1] += bob.astype(np.float32)
+
+            yaw_values = np.unwrap(np.deg2rad([math.degrees(self.yaw)] + [item["yaw_degrees"] for item in new_trail]))
+            pitch_values = np.deg2rad([math.degrees(self.pitch)] + [item["pitch_degrees"] for item in new_trail])
+            src = np.linspace(0.0, 1.0, len(yaw_values), dtype=np.float32)
+            yaw = np.interp(frac, src, yaw_values).astype(np.float32)
+            pitch = np.interp(frac, src, pitch_values).astype(np.float32)
+        elif "target_position" in cmd:
+            target = np.asarray(cmd["target_position"], dtype=np.float32)
+            delta = target - self.position
+            delta_norm = float(np.linalg.norm(delta))
+            max_delta = self.free_roam_max_delta
+            if max_delta <= 0.0:
+                max_delta = max(self.speed * float(num_frames), self.clearance)
+            if delta_norm > max_delta:
+                target = self.position + delta / max(delta_norm, 1e-6) * max_delta
+            desired = self.position[None, :] + (target - self.position)[None, :] * frac[:, None]
+            if self.bob > 0.0:
+                bob = self.bob * np.sin(2.0 * math.pi * (self.frame_index + np.arange(total)) / 24.0)
+                desired[:, 1] += bob.astype(np.float32)
+
+            target_yaw = math.radians(_json_float(cmd.get("target_yaw"), math.degrees(self.yaw)))
+            target_pitch = math.radians(_json_float(cmd.get("target_pitch"), math.degrees(self.pitch)))
+            yaw = self.yaw + _short_angle_delta(target_yaw, self.yaw) * frac
+            pitch = self.pitch + (target_pitch - self.pitch) * frac
+        else:
+            turn_total = math.radians(_json_float(cmd.get("turn"), 0.0))
+            pitch_target = math.radians(_json_float(cmd.get("pitch"), math.degrees(self.pitch)))
+            yaw = self.yaw + turn_total * frac
+            pitch = self.pitch + (pitch_target - self.pitch) * frac
+
+            for i in range(1, total):
+                heading = np.array([math.sin(float(yaw[i])), 0.0, math.cos(float(yaw[i]))], dtype=np.float32)
+                right = np.array([math.cos(float(yaw[i])), 0.0, -math.sin(float(yaw[i]))], dtype=np.float32)
+                up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+                step = self.speed * _json_float(cmd.get("forward"), 0.0)
+                strafe = self.strafe * _json_float(cmd.get("strafe"), 0.0) * math.sin(2.0 * math.pi * float(frac[i]))
+                vertical = self.vertical_speed * _json_float(cmd.get("vertical"), 0.0)
+                bob = self.bob * math.sin(2.0 * math.pi * (self.frame_index + i) / 24.0)
+                desired[i] = desired[i - 1] + heading * step + right * strafe + up * vertical
+                desired[i, 1] += bob
+
+        planned = _wos_adjust_path(
+            desired,
+            self.points,
+            clearance=self.clearance,
+            step_fraction=self.step_fraction,
+        )
+
+        out_positions = planned[1 : int(num_frames) + 1]
+        out_yaw = yaw[1 : int(num_frames) + 1]
+        out_pitch = pitch[1 : int(num_frames) + 1]
+        w2c = []
+        for p, y, pt in zip(out_positions, out_yaw, out_pitch):
+            forward = np.array(
+                [
+                    math.sin(float(y)) * math.cos(float(pt)),
+                    math.sin(float(pt)),
+                    math.cos(float(y)) * math.cos(float(pt)),
+                ],
+                dtype=np.float32,
+            )
+            target = p + forward * self.center_depth
+            w2c.append(_look_at_w2c_np(p, target))
+
+        self.position = planned[int(num_frames)].astype(np.float32)
+        self.yaw = float(yaw[int(num_frames)])
+        self.pitch = float(pitch[int(num_frames)])
+        self.frame_index += int(num_frames)
+        w2c_np = np.stack(w2c, axis=0).astype(np.float32)
+        K_np = np.repeat(self.K[None], int(num_frames), axis=0).astype(np.float32)
+        self.generated_w2c.extend(w2c_np)
+        self.generated_K.extend(K_np)
+        self.generated_positions.extend(out_positions.astype(np.float32))
+        return torch.from_numpy(w2c_np), torch.from_numpy(K_np)
+
+    def update_from_pipeline(self, pipeline) -> None:
+        cache = getattr(pipeline, "retrieval_cache", None)
+        if cache is None or not getattr(cache, "_world_points", None):
+            return
+        pts_parts = [self.seed_points]
+        per_entry_cap = max(256, self.map_update_max_points // max(1, len(cache._world_points)))
+        for world_t in cache._world_points:
+            pts = world_t.detach().to(torch.float32).cpu().numpy().reshape(-1, 3)
+            valid = np.isfinite(pts).all(axis=1) & (np.linalg.norm(pts, axis=1) > 1e-5)
+            pts = pts[valid]
+            if pts.shape[0] > per_entry_cap:
+                sel = np.linspace(0, pts.shape[0] - 1, per_entry_cap, dtype=np.int64)
+                pts = pts[sel]
+            if pts.size:
+                pts_parts.append(pts.astype(np.float32))
+        points = np.concatenate(pts_parts, axis=0)
+        if points.shape[0] > self.map_update_max_points:
+            sel = np.linspace(0, points.shape[0] - 1, self.map_update_max_points, dtype=np.int64)
+            points = points[sel]
+        self.points = points.astype(np.float32)
+
+    def save_trajectory(self, path: str) -> None:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        np.savez(
+            path,
+            w2c=np.stack(self.generated_w2c, axis=0).astype(np.float32),
+            intrinsics=np.stack(self.generated_K, axis=0).astype(np.float32),
+            positions=np.stack(self.generated_positions, axis=0).astype(np.float32),
+            image_height=np.array(int(self.K[1, 2] * 2), dtype=np.int64),
+            image_width=np.array(int(self.K[0, 2] * 2), dtype=np.int64),
+            center_depth=np.array(self.center_depth, dtype=np.float32),
+            clearance=np.array(self.clearance, dtype=np.float32),
+            sparse_points=np.array(self.points.shape[0], dtype=np.int64),
+            command_history=np.array(json.dumps(self.command_history)),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
@@ -127,10 +829,15 @@ def parse_arguments() -> argparse.Namespace:
     # Input
     parser.add_argument("--input_image_path", type=str, required=True,
                         help="Path to a single image or a folder of images")
-    parser.add_argument("--trajectory_path", type=str, required=True,
+    parser.add_argument("--trajectory_path", type=str, default=None,
                         help="Path to .npz trajectory file (or a folder of per-image .npz files). "
                              "Expected keys: w2c (N,4,4), intrinsics (N,3,3), "
                              "image_height, image_width.")
+    parser.add_argument("--trajectory_preset", type=str, default="file",
+                        choices=["file", "wos_360", "wos_lookaround", "wos_walk"],
+                        help="Use 'file' to load --trajectory_path, 'wos_360' for a large depth-aware "
+                             "orbit, 'wos_lookaround' for slow yaw/pitch scanning, or 'wos_walk' "
+                             "for chunk-wise walking traversal.")
     parser.add_argument("--num_samples", type=int, default=10)
     parser.add_argument("--sample_start_idx", type=int, default=0)
     parser.add_argument("--prompt", type=str, default="",
@@ -155,8 +862,89 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--fps", type=int, default=16)
     parser.add_argument("--num_frames", type=int, default=161,
                         help="Number of frames to generate (taken from the start of the trajectory).")
+    parser.add_argument("--continuous_chunks", type=int, default=0,
+                        help="Generate this many AR chunks in streaming/ring mode. "
+                             "Overrides --num_frames as 1 + chunks * new_video_frames.")
+    parser.add_argument("--unbounded_stream", action="store_true",
+                        help="Keep generating streaming chunks until interrupted. Use --stream_max_chunks to cap tests.")
+    parser.add_argument("--stream_max_chunks", type=int, default=0,
+                        help="Safety cap for --unbounded_stream. 0 means no cap.")
+    parser.add_argument("--trajectory_extend", type=str, default="error",
+                        choices=["error", "loop", "repeat_last"],
+                        help="How to extend a short trajectory when continuous generation needs more poses.")
+    parser.add_argument("--stream_output_chunks", action="store_true",
+                        help="Save each generated AR chunk immediately instead of returning one full video tensor.")
+    parser.add_argument("--ring_history_latents", type=int, default=0,
+                        help="Recent latent history entries to keep in continuous mode. "
+                             "0 uses the model's minimum temporal history.")
+    parser.add_argument("--ring_history_frames", type=int, default=0,
+                        help="Recent pixel frames to keep in continuous mode. "
+                             "0 keeps enough for DA3 plus one generated chunk.")
+    parser.add_argument("--ring_cache_entries", type=int, default=32,
+                        help="Recent positive frame IDs to keep in Sparse3DCache in continuous mode.")
+    parser.add_argument("--ring_anchor_stride", type=int, default=0,
+                        help="Keep every Nth frame as a bounded landmark anchor in the ring cache. 0 disables.")
+    parser.add_argument("--ring_anchor_entries", type=int, default=12,
+                        help="Maximum periodic landmark anchors retained when --ring_anchor_stride is set.")
+    parser.add_argument("--stream_export_map_every", type=int, default=0,
+                        help="Export sparse stitched PLY map every N generated chunks. 0 disables map export.")
+    parser.add_argument("--stream_map_max_points", type=int, default=200000,
+                        help="Maximum points written to each sparse stitched map PLY.")
+    parser.add_argument("--stream_preview_frames", action="store_true",
+                        help="Write per-frame preview images plus manifest.json for the GL free-roam viewer.")
+    parser.add_argument("--stream_preview_dir", type=str, default=None,
+                        help="Preview frame directory. Defaults to <stream_output_dir>/preview when enabled.")
     parser.add_argument("--pose_scale", type=float, default=1.1,
                         help="Scale factor applied to w2c translation vectors.")
+    parser.add_argument("--wos_360_loops", type=float, default=1.0,
+                        help="Number of horizontal 360 loops for --trajectory_preset wos_360.")
+    parser.add_argument("--wos_360_radius_scale", type=float, default=1.0,
+                        help="Mid-orbit radius multiplier for the WoS 360 path. Endpoints stay at the seed pose.")
+    parser.add_argument("--wos_360_vertical_amp", type=float, default=0.04,
+                        help="Vertical sinusoid amplitude as a fraction of center depth for the WoS 360 path.")
+    parser.add_argument("--wos_360_clearance_ratio", type=float, default=0.06,
+                        help="Minimum camera clearance from DA3 point cloud as a fraction of center depth.")
+    parser.add_argument("--wos_360_step_fraction", type=float, default=0.9,
+                        help="Fraction of the estimated free-space sphere used by each WoS step.")
+    parser.add_argument("--wos_360_depth_stride", type=int, default=8,
+                        help="Pixel stride for the sparse depth point cloud used by WoS planning.")
+    parser.add_argument("--wos_360_max_points", type=int, default=20000,
+                        help="Maximum sparse depth points used by the WoS planner.")
+    parser.add_argument("--wos_360_depth_percentile", type=float, default=95.0,
+                        help="Depth percentile cap used when building the WoS point cloud.")
+    parser.add_argument("--wos_lookaround_yaw_degrees", type=float, default=360.0,
+                        help="Total yaw sweep for --trajectory_preset wos_lookaround.")
+    parser.add_argument("--wos_lookaround_pitch_degrees", type=float, default=35.0,
+                        help="Maximum up/down pitch angle for --trajectory_preset wos_lookaround.")
+    parser.add_argument("--wos_lookaround_pitch_cycles", type=float, default=1.0,
+                        help="Number of smooth up/down pitch oscillations during the look-around.")
+    parser.add_argument("--wos_lookaround_translation_ratio", type=float, default=0.008,
+                        help="Small camera drift as a fraction of center depth for WoS look-around.")
+    parser.add_argument("--walk_control_mode", type=str, default="random",
+                        choices=["random", "keyboard", "file", "free_roam"],
+                        help="Control source for --trajectory_preset wos_walk. "
+                             "Use free_roam with the JSON written by free_roam_control.py.")
+    parser.add_argument("--walk_control_path", type=str, default=None,
+                        help="Optional JSON command file for --walk_control_mode file/free_roam.")
+    parser.add_argument("--walk_speed_ratio", type=float, default=0.00025,
+                        help="Forward step per generated frame as a fraction of center depth.")
+    parser.add_argument("--walk_turn_degrees_per_chunk", type=float, default=18.0,
+                        help="Maximum turn applied over one AR chunk.")
+    parser.add_argument("--walk_random_turn_degrees", type=float, default=12.0,
+                        help="Random turn noise for autonomous walking mode.")
+    parser.add_argument("--walk_strafe_ratio", type=float, default=0.0015,
+                        help="Lateral walking sway as a fraction of center depth.")
+    parser.add_argument("--walk_bob_ratio", type=float, default=0.0015,
+                        help="Vertical camera bob as a fraction of center depth.")
+    parser.add_argument("--walk_pitch_degrees", type=float, default=5.0,
+                        help="Maximum pitch command used by walking trajectory control.")
+    parser.add_argument("--walk_vertical_ratio", type=float, default=0.00020,
+                        help="Free-roam vertical step per generated frame as a fraction of center depth.")
+    parser.add_argument("--walk_free_roam_max_chunk_ratio", type=float, default=0.05,
+                        help="Maximum distance a free-roam target may pull one generated chunk, "
+                             "as a fraction of center depth. Prevents huge jumps while Lyra is sampling.")
+    parser.add_argument("--walk_map_update_max_points", type=int, default=20000,
+                        help="Maximum sparse map points fed back into the walking planner.")
     parser.add_argument("--resolution", type=str, default="480,832", help="H,W")
     parser.add_argument("--context_parallel_size", type=int, default=1)
     parser.add_argument("--lora_paths", type=str, default=None, nargs="+")
@@ -322,6 +1110,41 @@ if __name__ == "__main__":
         model.config.warp_chunk_size = args.warp_chunk_size
         model.warp_chunk_size = args.warp_chunk_size
 
+    if args.trajectory_preset == "wos_walk" and int(args.continuous_chunks) <= 0 and not args.unbounded_stream:
+        args.continuous_chunks = max(1, (int(args.num_frames) - 1) // int(model.framepack_num_new_video_frames))
+
+    if int(args.continuous_chunks) > 0:
+        args.num_frames = 1 + int(args.continuous_chunks) * int(model.framepack_num_new_video_frames)
+        args.stream_output_chunks = True
+        args.enable_history_ring = True
+        if args.trajectory_preset == "file" and args.trajectory_extend == "error":
+            args.trajectory_extend = "loop"
+        if args.trajectory_preset == "wos_lookaround":
+            yaw_per_chunk = abs(float(args.wos_lookaround_yaw_degrees)) / max(1, int(args.continuous_chunks))
+            if yaw_per_chunk > 45.0:
+                recommended_chunks = int(math.ceil(abs(float(args.wos_lookaround_yaw_degrees)) / 35.0))
+                log.warning(
+                    f"[wos_lookaround] yaw_per_chunk={yaw_per_chunk:.1f} deg is likely too fast. "
+                    f"For steadier 360 look-around, use --continuous_chunks {recommended_chunks} "
+                    "or reduce --wos_lookaround_yaw_degrees.",
+                    rank0_only=True,
+                )
+        log.info(
+            f"[continuous] chunks={args.continuous_chunks}, num_frames={args.num_frames}, "
+            f"trajectory_extend={args.trajectory_extend}, ring_cache_entries={args.ring_cache_entries}",
+            rank0_only=True,
+        )
+    elif args.unbounded_stream:
+        args.stream_output_chunks = True
+        args.enable_history_ring = True
+        log.info(
+            f"[continuous] unbounded stream enabled, stream_max_chunks={args.stream_max_chunks}, "
+            f"ring_cache_entries={args.ring_cache_entries}",
+            rank0_only=True,
+        )
+    else:
+        args.enable_history_ring = bool(args.stream_output_chunks)
+
     # Resolution
     target_h, target_w = [int(x) for x in args.resolution.split(",")]
 
@@ -350,8 +1173,11 @@ if __name__ == "__main__":
         args.sample_start_idx : args.sample_start_idx + args.num_samples
     ]
 
+    if args.trajectory_preset == "file" and args.trajectory_path is None:
+        raise ValueError("--trajectory_path is required when --trajectory_preset=file")
+
     # Resolve trajectory file(s): single file shared across images, or per-image files in a folder.
-    traj_is_dir = os.path.isdir(args.trajectory_path)
+    traj_is_dir = args.trajectory_path is not None and os.path.isdir(args.trajectory_path)
 
     # Resolve captions source: per-chunk JSON or single caption
     captions_is_dir = args.captions_path is not None and os.path.isdir(args.captions_path)
@@ -362,24 +1188,27 @@ if __name__ == "__main__":
         base_name = os.path.splitext(os.path.basename(img_path))[0]
 
         video_path = os.path.join(args.output_path, f"{base_name}.mp4")
-        if os.path.exists(video_path):
+        if args.stream_output_chunks:
+            args.stream_output_dir = os.path.join(args.output_path, f"{base_name}_stream")
+            if args.stream_preview_frames and args.stream_preview_dir is None:
+                args.stream_preview_dir = os.path.join(args.stream_output_dir, "preview")
+            stream_manifest_path = os.path.join(args.stream_output_dir, "concat.txt")
+            video_exists = os.path.isdir(args.stream_output_dir) and os.path.exists(
+                stream_manifest_path
+            ) and os.path.getsize(
+                stream_manifest_path
+            )
+        else:
+            args.stream_output_dir = None
+            if args.stream_preview_frames and args.stream_preview_dir is None:
+                args.stream_preview_dir = None
+            video_exists = os.path.exists(video_path)
+        if video_exists:
             log.info(f"Skipping {img_path} (video already exists at {video_path})", rank0_only=True)
             continue
 
         log.info(f"Processing [{img_idx}]: {img_path}", rank0_only=True)
         misc.set_random_seed(seed=args.seed, by_rank=True)
-
-        # ---- Load trajectory ----
-        if traj_is_dir:
-            traj_file = os.path.join(args.trajectory_path, f"{base_name}.npz")
-        else:
-            traj_file = args.trajectory_path
-        if not os.path.isfile(traj_file):
-            log.error(f"Trajectory file not found: {traj_file}")
-            continue
-
-        w2cs_T_44, Ks_T_33 = load_trajectory(traj_file, N, target_hw=(target_h, target_w), pose_scale=args.pose_scale)
-        log.info(f"Loaded trajectory: {w2cs_T_44.shape[0]} frames from {traj_file}", rank0_only=True)
 
         # ---- Read image ----
         bgr = cv2.imread(img_path)
@@ -395,7 +1224,7 @@ if __name__ == "__main__":
             _offload_diffusion_to_cpu(model, True)
             _restore_module_to_device(da3_model, True, da3_target_device)
         try:
-            image_chw01, depth_hw, _K_33_da3, mask_hw = _da3_infer_depth_intrinsics_single(
+            image_chw01, depth_hw, K_33_da3, mask_hw = _da3_infer_depth_intrinsics_single(
                 da3_model=da3_model,
                 img_rgb_uint8=rgb_t,
                 target_hw=(target_h, target_w),
@@ -460,6 +1289,139 @@ if __name__ == "__main__":
             del moge_depth_hw, moge_mask_hw, da3_d, da3_m
             torch.cuda.empty_cache()
             gc.collect()
+
+        # ---- Load or generate trajectory ----
+        trajectory_stream = None
+        if args.trajectory_preset == "wos_360":
+            w2cs_T_44, Ks_T_33, wos_stats = build_wos_360_trajectory(
+                depth_hw,
+                K_33_da3,
+                mask_hw,
+                num_frames=N,
+                loops=args.wos_360_loops,
+                radius_scale=args.wos_360_radius_scale,
+                vertical_amp=args.wos_360_vertical_amp,
+                clearance_ratio=args.wos_360_clearance_ratio,
+                step_fraction=args.wos_360_step_fraction,
+                depth_stride=args.wos_360_depth_stride,
+                max_points=args.wos_360_max_points,
+                depth_percentile=args.wos_360_depth_percentile,
+            )
+            traj_file = os.path.join(args.output_path, f"{base_name}_wos_360_trajectory.npz")
+            np.savez(
+                traj_file,
+                w2c=w2cs_T_44.numpy().astype(np.float32),
+                intrinsics=Ks_T_33.numpy().astype(np.float32),
+                image_height=np.array(target_h, dtype=np.int64),
+                image_width=np.array(target_w, dtype=np.int64),
+                center_depth=np.array(wos_stats["center_depth"], dtype=np.float32),
+                clearance=np.array(wos_stats["clearance"], dtype=np.float32),
+                sparse_points=np.array(wos_stats["num_points"], dtype=np.int64),
+            )
+            log.info(
+                f"Generated WoS 360 trajectory: {traj_file} "
+                f"(frames={w2cs_T_44.shape[0]}, center_depth={wos_stats['center_depth']:.4f}, "
+                f"clearance={wos_stats['clearance']:.4f}, points={int(wos_stats['num_points'])})",
+                rank0_only=True,
+            )
+        elif args.trajectory_preset == "wos_walk":
+            trajectory_stream = WosWalkTrajectoryStream(
+                depth_hw,
+                K_33_da3,
+                mask_hw,
+                seed=args.seed,
+                speed_ratio=args.walk_speed_ratio,
+                turn_degrees_per_chunk=args.walk_turn_degrees_per_chunk,
+                random_turn_degrees=args.walk_random_turn_degrees,
+                strafe_ratio=args.walk_strafe_ratio,
+                bob_ratio=args.walk_bob_ratio,
+                pitch_degrees=args.walk_pitch_degrees,
+                vertical_ratio=args.walk_vertical_ratio,
+                free_roam_max_chunk_ratio=args.walk_free_roam_max_chunk_ratio,
+                clearance_ratio=args.wos_360_clearance_ratio,
+                step_fraction=args.wos_360_step_fraction,
+                depth_stride=args.wos_360_depth_stride,
+                max_points=args.wos_360_max_points,
+                depth_percentile=args.wos_360_depth_percentile,
+                control_mode=args.walk_control_mode,
+                control_path=args.walk_control_path,
+                map_update_max_points=args.walk_map_update_max_points,
+            )
+            w2cs_T_44 = torch.eye(4, dtype=torch.float32).unsqueeze(0)
+            Ks_T_33 = K_33_da3.detach().to(dtype=torch.float32, device="cpu").unsqueeze(0)
+            traj_file = os.path.join(args.output_path, f"{base_name}_wos_walk_seed_trajectory.npz")
+            np.savez(
+                traj_file,
+                w2c=w2cs_T_44.numpy().astype(np.float32),
+                intrinsics=Ks_T_33.numpy().astype(np.float32),
+                image_height=np.array(target_h, dtype=np.int64),
+                image_width=np.array(target_w, dtype=np.int64),
+                center_depth=np.array(trajectory_stream.center_depth, dtype=np.float32),
+                clearance=np.array(trajectory_stream.clearance, dtype=np.float32),
+                sparse_points=np.array(trajectory_stream.points.shape[0], dtype=np.int64),
+                control_mode=np.array(args.walk_control_mode),
+            )
+            log.info(
+                f"Initialized WoS walk stream: {traj_file} "
+                f"(center_depth={trajectory_stream.center_depth:.4f}, "
+                f"clearance={trajectory_stream.clearance:.4f}, points={trajectory_stream.points.shape[0]}, "
+                f"control={args.walk_control_mode})",
+                rank0_only=True,
+            )
+        elif args.trajectory_preset == "wos_lookaround":
+            w2cs_T_44, Ks_T_33, wos_stats = build_wos_lookaround_trajectory(
+                depth_hw,
+                K_33_da3,
+                mask_hw,
+                num_frames=N,
+                yaw_degrees=args.wos_lookaround_yaw_degrees,
+                pitch_degrees=args.wos_lookaround_pitch_degrees,
+                pitch_cycles=args.wos_lookaround_pitch_cycles,
+                translation_ratio=args.wos_lookaround_translation_ratio,
+                clearance_ratio=args.wos_360_clearance_ratio,
+                step_fraction=args.wos_360_step_fraction,
+                depth_stride=args.wos_360_depth_stride,
+                max_points=args.wos_360_max_points,
+                depth_percentile=args.wos_360_depth_percentile,
+            )
+            traj_file = os.path.join(args.output_path, f"{base_name}_wos_lookaround_trajectory.npz")
+            np.savez(
+                traj_file,
+                w2c=w2cs_T_44.numpy().astype(np.float32),
+                intrinsics=Ks_T_33.numpy().astype(np.float32),
+                image_height=np.array(target_h, dtype=np.int64),
+                image_width=np.array(target_w, dtype=np.int64),
+                center_depth=np.array(wos_stats["center_depth"], dtype=np.float32),
+                clearance=np.array(wos_stats["clearance"], dtype=np.float32),
+                sparse_points=np.array(wos_stats["num_points"], dtype=np.int64),
+                yaw_degrees=np.array(wos_stats["yaw_degrees"], dtype=np.float32),
+                pitch_degrees=np.array(wos_stats["pitch_degrees"], dtype=np.float32),
+                max_drift=np.array(wos_stats["max_drift"], dtype=np.float32),
+            )
+            log.info(
+                f"Generated WoS look-around trajectory: {traj_file} "
+                f"(frames={w2cs_T_44.shape[0]}, yaw={wos_stats['yaw_degrees']:.1f}, "
+                f"pitch=+/-{wos_stats['pitch_degrees']:.1f}, max_drift={wos_stats['max_drift']:.4f}, "
+                f"clearance={wos_stats['clearance']:.4f}, points={int(wos_stats['num_points'])})",
+                rank0_only=True,
+            )
+        else:
+            if traj_is_dir:
+                traj_file = os.path.join(args.trajectory_path, f"{base_name}.npz")
+            else:
+                traj_file = args.trajectory_path
+            if not os.path.isfile(traj_file):
+                log.error(f"Trajectory file not found: {traj_file}")
+                continue
+
+            w2cs_T_44, Ks_T_33 = load_trajectory(
+                traj_file,
+                N,
+                target_hw=(target_h, target_w),
+                pose_scale=args.pose_scale,
+                extend_mode=args.trajectory_extend,
+            )
+            log.info(f"Loaded trajectory: {w2cs_T_44.shape[0]} frames from {traj_file}", rank0_only=True)
 
         img_bchw = image_chw01.to(device=desired_device) * 2.0 - 1.0
 
@@ -544,7 +1506,8 @@ if __name__ == "__main__":
         # ---- Assemble data batch ----
         w2cs_b_t_44 = w2cs_T_44.unsqueeze(0).to(dtype=torch.float32, device=desired_device)
         Ks_b_t_33 = Ks_T_33.unsqueeze(0).to(dtype=torch.float32, device=desired_device)
-        depth_b_thw = depth_hw.unsqueeze(0).unsqueeze(0).repeat(1, N, 1, 1).to(device=desired_device)
+        depth_T = 1 if trajectory_stream is not None else N
+        depth_b_thw = depth_hw.unsqueeze(0).unsqueeze(0).repeat(1, depth_T, 1, 1).to(device=desired_device)
 
         data_batch = {
             "video": img_bchw.unsqueeze(2),
@@ -557,6 +1520,8 @@ if __name__ == "__main__":
             "intrinsics": Ks_b_t_33,
             "depth": depth_b_thw,
         }
+        if trajectory_stream is not None:
+            data_batch["trajectory_stream"] = trajectory_stream
 
         if use_chunk_captions:
             data_batch["t5_chunk_keys"] = t5_chunk_keys
@@ -573,7 +1538,10 @@ if __name__ == "__main__":
         )
 
         # ---- Run AR inference ----
-        log.info(f"=== Generating video ({N} frames) ===", rank0_only=True)
+        if trajectory_stream is not None and args.unbounded_stream:
+            log.info("=== Generating unbounded streaming video ===", rank0_only=True)
+        else:
+            log.info(f"=== Generating video ({N} frames) ===", rank0_only=True)
         result = run_lyra2_sample(
             model,
             data_batch,
@@ -586,6 +1554,17 @@ if __name__ == "__main__":
 
         if result is None:
             log.warning(f"Generation failed for {img_path}", rank0_only=True)
+            continue
+
+        if args.stream_output_chunks:
+            log.info(
+                f"Saved streaming chunks: {result['stream_dir']} (manifest: {result['manifest']})",
+                rank0_only=True,
+            )
+            del result, data_batch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
             continue
 
         # ---- Save output video ----

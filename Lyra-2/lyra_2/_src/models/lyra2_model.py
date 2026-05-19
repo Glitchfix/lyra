@@ -1617,6 +1617,7 @@ class Lyra2Model(WANDiffusionModel):
         spatial_selected_coords: Optional[torch.Tensor] = None,
         *,
         video: Optional[torch.Tensor] = None,
+        video_frame_ids: Optional[torch.Tensor] = None,
         camera_w2c: Optional[torch.Tensor] = None,
         intrinsics: Optional[torch.Tensor] = None,
         buffer_depth_B_1_H_W: Optional[torch.Tensor] = None,
@@ -1644,6 +1645,23 @@ class Lyra2Model(WANDiffusionModel):
             spatial_condition_pixels_list: list[torch.Tensor] = []
 
             with misc.timer("camera_pose_condition - corruptor"):
+                def _video_abs_frame(f_id: int) -> torch.Tensor:
+                    fid = int(f_id)
+                    if video_frame_ids is None:
+                        return video[:, :, fid]
+
+                    match = (video_frame_ids == fid).nonzero(as_tuple=False)
+                    if int(match.numel()) > 0:
+                        pos = int(match[0].item())
+                        return video[:, :, pos]
+
+                    if spatial_cache is not None:
+                        try:
+                            return spatial_cache.get_rgb_by_frame_id(fid).to(device=device, dtype=video.dtype)
+                        except KeyError:
+                            pass
+                    raise KeyError(f"frame_id={fid} is not available in the video ring or spatial cache")
+
                 # _warp_multisrc: shared helper for accumulated PCD / correspondence warping.
                 def _warp_multisrc(
                     src_rgb: torch.Tensor,
@@ -1764,7 +1782,7 @@ class Lyra2Model(WANDiffusionModel):
                 )
 
                 # Buffer warp for main conditioning tail
-                buf_rgb = video[:, :, abs_buffer_idx].to(dtype=torch.float32).unsqueeze(1)  # [B,1,C,H,W]
+                buf_rgb = _video_abs_frame(abs_buffer_idx).to(dtype=torch.float32).unsqueeze(1)  # [B,1,C,H,W]
                 buf_depth = buffer_depth_B_1_H_W.to(device=device, dtype=torch.float32).unsqueeze(1)  # [B,1,1,H,W]
                 buf_w2c = camera_w2c[:, abs_buffer_idx].to(dtype=torch.float32).unsqueeze(1)  # [B,1,4,4]
                 buf_K = intrinsics[:, abs_buffer_idx].to(dtype=torch.float32).unsqueeze(1)  # [B,1,3,3]
@@ -1906,6 +1924,7 @@ class Lyra2Model(WANDiffusionModel):
         gen_cond: torch.Tensor,
         spatial_cache: Optional[Sparse3DCache],
         video: torch.Tensor,
+        video_frame_ids: Optional[torch.Tensor],
         buffer_depth_B_1_H_W: Optional[torch.Tensor],
         camera_w2c: torch.Tensor,
         intrinsics: torch.Tensor,
@@ -2077,6 +2096,7 @@ class Lyra2Model(WANDiffusionModel):
             spatial_selected_frame_ids=spatial_selected_frame_ids_t,
             spatial_selected_coords=spatial_selected_coords,
             video=video,
+            video_frame_ids=video_frame_ids,
             camera_w2c=camera_w2c,
             intrinsics=intrinsics,
             buffer_depth_B_1_H_W=buffer_depth_B_1_H_W,
@@ -2100,7 +2120,18 @@ class Lyra2Model(WANDiffusionModel):
                         mv_rgb = mv_rgb.unsqueeze(2)
                     spatial_latents_list.append(self.encode(mv_rgb))
                 else:
-                    spatial_latents_list.append(self.encode(video[:, :, t : t + 1]))
+                    if video_frame_ids is None:
+                        spatial_latents_list.append(self.encode(video[:, :, t : t + 1]))
+                    else:
+                        match = (video_frame_ids == int(t)).nonzero(as_tuple=False)
+                        if int(match.numel()) > 0:
+                            pos = int(match[0].item())
+                            spatial_latents_list.append(self.encode(video[:, :, pos : pos + 1]))
+                        else:
+                            rgb = spatial_cache.get_rgb_by_frame_id(int(t)).to(device=device, dtype=video.dtype)
+                            if rgb.dim() == 4:
+                                rgb = rgb.unsqueeze(2)
+                            spatial_latents_list.append(self.encode(rgb))
             spatial_latents = torch.cat(spatial_latents_list, dim=2)
 
             spatial_plucker = None
@@ -2412,6 +2443,7 @@ class Lyra2Model(WANDiffusionModel):
                     gen_cond=gen_cond,
                     spatial_cache=spatial_cache,
                     video=data_batch["video"].to(device=latents.device, dtype=latents.dtype),
+                    video_frame_ids=None,
                     buffer_depth_B_1_H_W=buffer_depth_B_1_H_W,
                     camera_w2c=data_batch["camera_w2c"],
                     intrinsics=data_batch["intrinsics"],
@@ -2575,6 +2607,19 @@ class Sparse3DCache:
         if self._store_device == "cpu":
             t = t.to("cpu", non_blocking=True)
         self._rgbs[int(frame_id)] = t
+
+    def prune_to_frame_ids(self, keep_frame_ids: set[int]) -> None:
+        """Drop cache entries whose frame_id is not in ``keep_frame_ids``."""
+        keep = {int(x) for x in keep_frame_ids}
+        keep_idx = [i for i, frame_id in enumerate(self._frame_ids) if int(frame_id) in keep]
+        self._world_points = [self._world_points[i] for i in keep_idx]
+        self._latent_indices = [self._latent_indices[i] for i in keep_idx]
+        self._frame_ids = [self._frame_ids[i] for i in keep_idx]
+        if self._store_values:
+            self._depths = [self._depths[i] for i in keep_idx]
+            self._w2cs = [self._w2cs[i] for i in keep_idx]
+            self._Ks = [self._Ks[i] for i in keep_idx]
+        self._rgbs = {k: v for k, v in self._rgbs.items() if int(k) in keep}
 
     def get_rgb_by_frame_id(self, frame_id: int) -> torch.Tensor:
         """Return stored RGB for a frame_id. Raises KeyError if not found."""

@@ -16,11 +16,15 @@
 from lyra_2._ext.imaginaire.visualize.video import save_img_or_video
 from lyra_2._ext.imaginaire.utils import log, misc
 import os
+import json
+import itertools
 import re
 import sys
+import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+import cv2
 import numpy as np
 from megatron.core import parallel_state
 from einops import rearrange, repeat
@@ -33,6 +37,70 @@ from lyra_2._src.datasets.forward_warp_utils_pytorch import (
 )
 
 torch.enable_grad(False)
+
+
+def _atomic_write_json(path: str | os.PathLike[str], payload: dict) -> None:
+    path = os.fspath(path)
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp, path)
+
+
+def _video_tensor_to_uint8_thwc(video: torch.Tensor) -> np.ndarray:
+    arr = video.detach().to(dtype=torch.float32, device="cpu").clamp(0.0, 1.0)
+    if arr.ndim == 5 and arr.shape[0] == 1:
+        arr = arr[0]
+    if arr.ndim != 4:
+        raise ValueError(f"Expected 4D video tensor, got shape {tuple(arr.shape)}")
+    if int(arr.shape[0]) in (1, 3):
+        arr = arr.permute(1, 2, 3, 0)
+    elif int(arr.shape[1]) in (1, 3):
+        arr = arr.permute(0, 2, 3, 1)
+    else:
+        raise ValueError(f"Cannot infer video layout from shape {tuple(arr.shape)}")
+    np_arr = (arr.numpy() * 255.0).round().astype(np.uint8)
+    if np_arr.shape[-1] == 1:
+        np_arr = np.repeat(np_arr, 3, axis=-1)
+    return np_arr
+
+
+def _write_stream_preview(
+    video: torch.Tensor,
+    preview_dir: str,
+    *,
+    chunk_index: int,
+    fps: int,
+) -> dict:
+    frames = _video_tensor_to_uint8_thwc(video)
+    chunk_dir = os.path.join(preview_dir, f"chunk_{int(chunk_index):04d}")
+    os.makedirs(chunk_dir, exist_ok=True)
+
+    frame_paths = []
+    for i, rgb in enumerate(frames):
+        path = os.path.join(chunk_dir, f"frame_{i:04d}.png")
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(path, bgr)
+        frame_paths.append(os.path.relpath(path, preview_dir))
+
+    latest_path = os.path.join(preview_dir, "latest.png")
+    if len(frames) > 0:
+        cv2.imwrite(latest_path, cv2.cvtColor(frames[-1], cv2.COLOR_RGB2BGR))
+
+    manifest = {
+        "schema": "lyra_stream_preview.v1",
+        "chunk_index": int(chunk_index),
+        "fps": int(fps),
+        "num_frames": int(len(frame_paths)),
+        "height": int(frames.shape[1]) if len(frames) else 0,
+        "width": int(frames.shape[2]) if len(frames) else 0,
+        "frames": frame_paths,
+        "latest_frame": os.path.relpath(latest_path, preview_dir),
+        "updated_time": time.time(),
+    }
+    _atomic_write_json(os.path.join(preview_dir, "manifest.json"), manifest)
+    return manifest
 
 def _get_vae_handles(model):
     vae_iface = model.tokenizer
@@ -162,6 +230,7 @@ def _predict_da3_depth_window(
     history_frames: torch.Tensor,
     start_index: int,
     abs_last_idx: int,
+    history_frame_ids: Optional[List[int]] = None,
     cam_w2c: torch.Tensor,
     intrinsics: torch.Tensor,
     frame_interval: int,
@@ -211,13 +280,23 @@ def _predict_da3_depth_window(
     images: List[np.ndarray] = []
     exts: List[np.ndarray] = []
     ixts: List[np.ndarray] = []
+    used_frames: List[int] = []
 
     hist_cpu = history_frames[0].detach().cpu()  # [C,T,H,W]
     cam_cpu = cam_w2c.detach().cpu()
     intr_cpu = intrinsics.detach().cpu()
+    frame_id_to_pos = None
+    if history_frame_ids is not None:
+        frame_id_to_pos = {int(frame_id): i for i, frame_id in enumerate(history_frame_ids)}
 
     for f in selected_frames:
-        t = start_index + f
+        if frame_id_to_pos is None:
+            t = start_index + f
+        else:
+            pos = frame_id_to_pos.get(int(f))
+            if pos is None:
+                continue
+            t = start_index + int(pos)
         if t < 0 or t >= T_total:
             continue
         frame_chw = hist_cpu[:, t]  # [C,H,W] in [-1,1]
@@ -226,6 +305,7 @@ def _predict_da3_depth_window(
         images.append(np.clip(frame_hwc * 255.0 + 0.5, 0, 255).astype(np.uint8))
         exts.append(cam_cpu[0, f].numpy().astype(np.float32))
         ixts.append(intr_cpu[0, f].numpy().astype(np.float32))
+        used_frames.append(int(f))
 
     if not images:
         return {"frame_indices": [], "prediction": None}
@@ -259,7 +339,7 @@ def _predict_da3_depth_window(
     )
 
     return {
-        "frame_indices": selected_frames,
+        "frame_indices": used_frames,
         "prediction": prediction,
     }
 
@@ -407,6 +487,7 @@ class Lyra2InferencePipeline:
         self.repeat_pixels = (self.T_hist - 1) * self.frames_per_latent + 1
 
         init_video = first_frame.repeat(1, 1, self.repeat_pixels, 1, 1)
+        self.first_frame = first_frame[:, :, :1].detach()
         self.history_frames = init_video
         _, self.vae_wrap, self.vae_core = _get_vae_handles(model)
         self.history_latents, self.enc_feat_cache = _prime_encoder_cache_with_history(
@@ -426,9 +507,12 @@ class Lyra2InferencePipeline:
             enable_offload=args.offload,
         )
         self.first_latent = self.history_latents[:, :, :1]
+        self.history_frame_ids: List[int] = [0]
+        self.history_latent_frame_ids: List[int] = [0] * int(self.history_latents.shape[2])
         if args.offload:
             self.history_latents = self.history_latents.cpu()
             self.history_frames = self.history_frames.cpu()
+            self.first_frame = self.first_frame.cpu()
 
         self.last_hist_frame = first_frame[:, :, 0]
 
@@ -543,6 +627,7 @@ class Lyra2InferencePipeline:
                     latent_index=0,
                     frame_id=0,
                 )
+                self.retrieval_cache.store_rgb(0, first_img_bchw)
                 self.buffer_depth_latest = first_depth_b1hw.to(torch.float32)
                 self.buffer_depth_latest_frame_idx = 0
             # Seed mask (best-effort): valid where depth > 0. DA3 sky mask is applied later during updates.
@@ -589,6 +674,8 @@ class Lyra2InferencePipeline:
         snap["history_latents_T"] = int(self.history_latents.shape[2])
         snap["cam_w2c_T"] = int(self.cam_w2c.shape[1])
         snap["intrinsics_T"] = int(self.intrinsics.shape[1])
+        snap["history_frame_ids"] = list(self.history_frame_ids)
+        snap["history_latent_frame_ids"] = list(self.history_latent_frame_ids)
 
         # VAE caches – must deep-clone (list of tensors or Nones).
         snap["enc_feat_cache"] = _clone_cache_list(self.enc_feat_cache)
@@ -644,6 +731,8 @@ class Lyra2InferencePipeline:
         self.history_latents = self.history_latents[:, :, : snap["history_latents_T"]].contiguous()
         self.cam_w2c = self.cam_w2c[:, : snap["cam_w2c_T"]].contiguous()
         self.intrinsics = self.intrinsics[:, : snap["intrinsics_T"]].contiguous()
+        self.history_frame_ids = list(snap["history_frame_ids"])
+        self.history_latent_frame_ids = list(snap["history_latent_frame_ids"])
 
         # Restore VAE caches.
         self.enc_feat_cache = snap["enc_feat_cache"]
@@ -708,6 +797,143 @@ class Lyra2InferencePipeline:
         neg = neg_t5_text_embeddings if neg_t5_text_embeddings is not None else self.base_neg_t5_text_embeddings
         return pos, neg
 
+    def _build_video_indices(self, end_px_idx: int, device) -> torch.Tensor:
+        new_frame_ids = list(range(1 + self.ar_idx * self.model.framepack_num_new_video_frames, int(end_px_idx)))
+        if not getattr(self.args, "enable_history_ring", False):
+            ids = [0] * int(self.repeat_pixels) + list(range(1, int(end_px_idx)))
+            return torch.tensor(ids, device=device, dtype=torch.long)
+
+        frames_per_lat = int(self.frames_per_latent)
+        ids: List[int] = []
+        for i, frame_id in enumerate(self.history_latent_frame_ids):
+            span = 1 if i == 0 else frames_per_lat
+            ids.extend([int(frame_id)] * span)
+        ids.extend(new_frame_ids)
+        return torch.tensor(ids, device=device, dtype=torch.long)
+
+    def _get_history_frame_by_abs(self, frame_id: int) -> Optional[torch.Tensor]:
+        fid = int(frame_id)
+        try:
+            pos = self.history_frame_ids.index(fid)
+        except ValueError:
+            return None
+        return self.history_frames[:, :, self.start_index + pos]
+
+    def _trim_history_ring(self) -> None:
+        if not getattr(self.args, "enable_history_ring", False):
+            return
+
+        min_recent_latents = max(0, int(self.model.framepack_num_temporal_hist) - 1)
+        requested_latents = int(getattr(self.args, "ring_history_latents", 0) or 0)
+        keep_recent_latents = max(min_recent_latents, requested_latents)
+        if keep_recent_latents > 0 and len(self.history_latent_frame_ids) > keep_recent_latents + 1:
+            first_latent = self.history_latents[:, :, :1]
+            recent_latents = self.history_latents[:, :, -keep_recent_latents:]
+            self.history_latents = torch.cat([first_latent, recent_latents], dim=2).contiguous()
+            self.history_latent_frame_ids = [0] + self.history_latent_frame_ids[-keep_recent_latents:]
+
+        da3_window = int(getattr(self.args, "da3_frame_interval", 8)) * max(
+            0, int(getattr(self.args, "da3_max_history_frames", 10)) - 1
+        ) + 1
+        requested_frames = int(getattr(self.args, "ring_history_frames", 0) or 0)
+        keep_recent_frames = max(da3_window, requested_frames, int(self.model.framepack_num_new_video_frames) + 1)
+        if keep_recent_frames > 0 and len(self.history_frame_ids) > keep_recent_frames + 1:
+            recent_frames = self.history_frames[:, :, -keep_recent_frames:]
+            recent_ids = self.history_frame_ids[-keep_recent_frames:]
+            first_frame = self.first_frame.to(device=recent_frames.device, dtype=recent_frames.dtype)
+            prefix = first_frame.repeat(1, 1, int(self.start_index), 1, 1)
+            self.history_frames = torch.cat([prefix, first_frame, recent_frames], dim=2).contiguous()
+            self.history_frame_ids = [0] + recent_ids
+
+        max_cache_entries = int(getattr(self.args, "ring_cache_entries", 0) or 0)
+        if self.retrieval_cache is not None and max_cache_entries > 0:
+            positive_ids = [int(x) for x in self.retrieval_cache._frame_ids if int(x) >= 0]
+            keep_positive = set(positive_ids[-max_cache_entries:])
+            anchor_stride = int(getattr(self.args, "ring_anchor_stride", 0) or 0)
+            anchor_entries = int(getattr(self.args, "ring_anchor_entries", 0) or 0)
+            if anchor_stride > 0 and anchor_entries > 0:
+                anchors = [frame_id for frame_id in positive_ids if frame_id > 0 and frame_id % anchor_stride == 0]
+                keep_positive.update(anchors[-anchor_entries:])
+            keep_ids = keep_positive | {0}
+            keep_ids.update(int(x) for x in self.retrieval_cache._frame_ids if int(x) < 0)
+            self.retrieval_cache.prune_to_frame_ids(keep_ids)
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def export_sparse_map(self, ply_path: str, max_points: int = 200000) -> dict:
+        """Export the current sparse spatial cache as an RGB point cloud.
+
+        This intentionally exports the sparse conditioning map, not every video
+        pixel. It is meant as a lightweight stitched map for long-running streams.
+        """
+        if self.retrieval_cache is None or not self.retrieval_cache._world_points:
+            return {"path": ply_path, "points": 0, "frames": 0}
+
+        pts_parts: list[np.ndarray] = []
+        color_parts: list[np.ndarray] = []
+        ds = max(1, int(getattr(self.retrieval_cache, "downsample", 1)))
+
+        for world_t, frame_id in zip(self.retrieval_cache._world_points, self.retrieval_cache._frame_ids):
+            pts = world_t.detach().to(torch.float32).cpu().numpy().reshape(-1, 3)
+            valid = np.isfinite(pts).all(axis=1) & (np.linalg.norm(pts, axis=1) > 1e-5)
+            if not np.any(valid):
+                continue
+
+            rgb_t = self.retrieval_cache._rgbs.get(int(frame_id))
+            if rgb_t is None:
+                rgb_t = self._get_history_frame_by_abs(int(frame_id))
+
+            if rgb_t is not None:
+                rgb_cpu = rgb_t.detach().to(torch.float32).cpu()
+                if rgb_cpu.dim() == 4:
+                    rgb_cpu = rgb_cpu[0]
+                if rgb_cpu.dim() == 3:
+                    rgb_ds = rgb_cpu[:, ::ds, ::ds]
+                    colors = (
+                        (rgb_ds.clamp(-1, 1) * 0.5 + 0.5)
+                        .mul(255.0)
+                        .permute(1, 2, 0)
+                        .reshape(-1, 3)
+                        .numpy()
+                        .astype(np.uint8)
+                    )
+                else:
+                    colors = np.full((pts.shape[0], 3), 200, dtype=np.uint8)
+            else:
+                colors = np.full((pts.shape[0], 3), 200, dtype=np.uint8)
+
+            if colors.shape[0] != pts.shape[0]:
+                colors = np.resize(colors, (pts.shape[0], 3)).astype(np.uint8)
+
+            pts_parts.append(pts[valid].astype(np.float32))
+            color_parts.append(colors[valid])
+
+        if not pts_parts:
+            return {"path": ply_path, "points": 0, "frames": 0}
+
+        points = np.concatenate(pts_parts, axis=0)
+        colors = np.concatenate(color_parts, axis=0)
+        if int(max_points) > 0 and points.shape[0] > int(max_points):
+            sel = np.linspace(0, points.shape[0] - 1, int(max_points), dtype=np.int64)
+            points = points[sel]
+            colors = colors[sel]
+
+        os.makedirs(os.path.dirname(os.path.abspath(ply_path)), exist_ok=True)
+        with open(ply_path, "w", encoding="utf-8") as f:
+            f.write("ply\n")
+            f.write("format ascii 1.0\n")
+            f.write(f"element vertex {points.shape[0]}\n")
+            f.write("property float x\nproperty float y\nproperty float z\n")
+            f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
+            f.write("end_header\n")
+            for p, c in zip(points, colors):
+                f.write(
+                    f"{float(p[0]):.6f} {float(p[1]):.6f} {float(p[2]):.6f} "
+                    f"{int(c[0])} {int(c[1])} {int(c[2])}\n"
+                )
+        return {"path": ply_path, "points": int(points.shape[0]), "frames": int(len(pts_parts))}
+
     def autoregressive_step(
         self,
         *,
@@ -741,12 +967,8 @@ class Lyra2InferencePipeline:
         device = history_full.device
         video_hist_abs = self.history_frames[:, :, self.start_index : ]
         video_all = misc.to(video_hist_abs, **self.model.tensor_kwargs)
-        # Build a virtual video_indices timeline: [0 repeated prefix] + [1..end_px_idx-1]
-        video_indices_t = torch.tensor(
-            [0] * int(self.repeat_pixels) + list(range(1, int(end_px_idx))),
-            device=device,
-            dtype=torch.long,
-        )
+        video_frame_ids_t = torch.tensor(self.history_frame_ids, device=device, dtype=torch.long)
+        video_indices_t = self._build_video_indices(int(end_px_idx), device)
 
         # Dummy generation tail; `_prepare_lyra2_inputs()` overwrites it with pose conditioning.
         B, C_lat, _T_hist, H_lat, W_lat = history_full.shape
@@ -771,6 +993,7 @@ class Lyra2InferencePipeline:
             gen_cond=gen_cond_dummy,
             spatial_cache=self.retrieval_cache,
             video=video_all,
+            video_frame_ids=video_frame_ids_t,
             buffer_depth_B_1_H_W=buffer_depth,
             camera_w2c=self.cam_w2c,
             intrinsics=self.intrinsics,
@@ -850,6 +1073,8 @@ class Lyra2InferencePipeline:
                 [self.history_frames, new_generated_frames.to(self.history_frames.dtype)],
                 dim=2,
             )
+        new_frame_ids = list(range(int(start_px_idx), int(end_px_idx)))
+        self.history_frame_ids.extend(new_frame_ids)
 
         _offload_diffusion_to_cpu(self.model, self.args.offload)
         with self.vae_wrap.context:
@@ -874,17 +1099,31 @@ class Lyra2InferencePipeline:
                 [self.history_latents, gen_chunk_reencoded.to(self.history_latents.dtype)],
                 dim=2,
             )
+        new_latent_ids = list(
+            range(
+                int(start_px_idx) + int(self.frames_per_latent) - 1,
+                int(end_px_idx),
+                int(self.frames_per_latent),
+            )
+        )
+        self.history_latent_frame_ids.extend(new_latent_ids[: int(gen_chunk_reencoded.shape[2])])
         self.last_hist_frame = new_generated_frames[:, :, -1]
         self.tokens_generated += self.model.framepack_num_new_latent_frames
+        stream_frames = (
+            new_generated_frames.detach().float().cpu()
+            if bool(getattr(self.args, "stream_output_chunks", False))
+            else None
+        )
 
         if self.use_pose and not is_last_step:
             self._update_depth_cache(end_px_idx)
+        self._trim_history_ring()
         del gen_chunk, new_generated_frames, gen_chunk_reencoded
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
         self.ar_idx += 1
-        return {"abort": False}
+        return {"abort": False, "new_frames": stream_frames}
 
     def _restore_model_to_gpu(self):
         _restore_diffusion_to_gpu(self.model, self.args.offload)
@@ -909,6 +1148,7 @@ class Lyra2InferencePipeline:
                     history_frames=self.history_frames,
                     start_index=self.start_index,
                     abs_last_idx=end_px_idx - 1,
+                    history_frame_ids=self.history_frame_ids,
                     cam_w2c=self.cam_w2c,
                     intrinsics=self.intrinsics,
                     frame_interval=int(self.args.da3_frame_interval),
@@ -1166,6 +1406,9 @@ class Lyra2InferencePipeline:
                         latent_index=int(cache_id),
                         frame_id=int(f_abs),
                     )
+                    rgb_t = self._get_history_frame_by_abs(int(f_abs))
+                    if rgb_t is not None:
+                        self.retrieval_cache.store_rgb(int(f_abs), rgb_t.to(torch.float32))
 
             # Store predicted-pose update info for the persistent wrapper to return to client.
             if use_predicted_pose and aligned_w2c_per_local is not None:
@@ -1289,68 +1532,169 @@ def run_lyra2_sample(
         multiview_data=multiview_data,
     )
 
-    num_frames = int(args.num_frames)
-    assert (num_frames - 1) % (pipeline.tokens_per_step * pipeline.frames_per_latent) == 0, (
-        f"N-1 must be divisible by tokens_per_step*frames_per_latent, but got {num_frames-1} "
-        f"and {pipeline.tokens_per_step * pipeline.frames_per_latent}"
-    )
+    trajectory_stream = data_batch.get("trajectory_stream", None)
+    unbounded_stream = bool(getattr(args, "unbounded_stream", False))
+    if trajectory_stream is None:
+        num_frames = int(args.num_frames)
+        assert (num_frames - 1) % (pipeline.tokens_per_step * pipeline.frames_per_latent) == 0, (
+            f"N-1 must be divisible by tokens_per_step*frames_per_latent, but got {num_frames-1} "
+            f"and {pipeline.tokens_per_step * pipeline.frames_per_latent}"
+        )
 
-    tokens_needed = (num_frames - 1 + pipeline.frames_per_latent - 1) // pipeline.frames_per_latent
-    num_iters = (tokens_needed + pipeline.tokens_per_step - 1) // pipeline.tokens_per_step
+        tokens_needed = (num_frames - 1 + pipeline.frames_per_latent - 1) // pipeline.frames_per_latent
+        num_iters = (tokens_needed + pipeline.tokens_per_step - 1) // pipeline.tokens_per_step
+    else:
+        if unbounded_stream:
+            num_iters = None
+        elif int(getattr(args, "continuous_chunks", 0) or 0) > 0:
+            num_iters = int(args.continuous_chunks)
+        else:
+            num_frames = int(args.num_frames)
+            assert (num_frames - 1) % (pipeline.tokens_per_step * pipeline.frames_per_latent) == 0, (
+                f"N-1 must be divisible by tokens_per_step*frames_per_latent, but got {num_frames-1} "
+                f"and {pipeline.tokens_per_step * pipeline.frames_per_latent}"
+            )
+            tokens_needed = (num_frames - 1 + pipeline.frames_per_latent - 1) // pipeline.frames_per_latent
+            num_iters = (tokens_needed + pipeline.tokens_per_step - 1) // pipeline.tokens_per_step
+
+    stream_output = bool(getattr(args, "stream_output_chunks", False))
+    stream_dir = getattr(args, "stream_output_dir", None)
+    stream_manifest: list[str] = []
+    stream_map_history: list[dict] = []
+    if stream_output:
+        if not stream_dir:
+            raise ValueError("stream_output_chunks=True requires args.stream_output_dir")
+        os.makedirs(stream_dir, exist_ok=True)
+    stream_preview_dir = getattr(args, "stream_preview_dir", None)
+    stream_preview_enabled = stream_output and bool(getattr(args, "stream_preview_frames", False)) and bool(stream_preview_dir)
+    if stream_preview_enabled:
+        os.makedirs(stream_preview_dir, exist_ok=True)
 
     with torch.inference_mode():
         log.info(log_prefix, rank0_only=True)
-        for ar_idx in tqdm.tqdm(range(num_iters)):
-            start_px_idx = 1 + ar_idx * model.framepack_num_new_video_frames
-            end_px_idx = start_px_idx + model.framepack_num_new_video_frames
-            cam_chunk = data_batch["camera_w2c"][:, start_px_idx:end_px_idx]
-            intr_chunk = data_batch["intrinsics"][:, start_px_idx:end_px_idx]
-
-            if "t5_chunk_keys" in data_batch:
-                t5_chunk_embeddings = data_batch["t5_chunk_embeddings"]
-                t5_chunk_mask = data_batch["t5_chunk_mask"]
-                B = int(data_batch["t5_chunk_keys"].shape[0])
-                if args.ablate_same_t5:
-                    pos_t5 = t5_chunk_embeddings[:, 0]
-                    data_batch["t5_text_embeddings"] = pos_t5
-                    data_batch["t5_text_mask"] = t5_chunk_mask[:, 0]
+        iterator = range(num_iters) if num_iters is not None else itertools.count()
+        if num_iters is not None:
+            iterator = tqdm.tqdm(iterator)
+        try:
+            for ar_idx in iterator:
+                if num_iters is None and int(getattr(args, "stream_max_chunks", 0) or 0) > 0:
+                    if ar_idx >= int(args.stream_max_chunks):
+                        break
+                start_px_idx = 1 + ar_idx * model.framepack_num_new_video_frames
+                end_px_idx = start_px_idx + model.framepack_num_new_video_frames
+                if trajectory_stream is None:
+                    cam_chunk = data_batch["camera_w2c"][:, start_px_idx:end_px_idx]
+                    intr_chunk = data_batch["intrinsics"][:, start_px_idx:end_px_idx]
                 else:
-                    last_hist_px_abs = ar_idx * model.framepack_num_new_video_frames + 1
-                    sample_frame_indices = data_batch["sample_frame_indices"]
-                    t5_chunk_keys = data_batch["t5_chunk_keys"]
-                    F_total = int(sample_frame_indices.shape[1])
-                    idx_clamped = min(max(0, last_hist_px_abs), F_total - 1)
-                    first_abs_idx_B = sample_frame_indices[:, idx_clamped].to(dtype=torch.long)
-                    selected_emb_list = []
-                    selected_mask_list = []
-                    for b in range(B):
-                        keys_b = t5_chunk_keys[b]
-                        Kb = int(keys_b.numel())
-                        val = int(first_abs_idx_B[b].item())
-                        pos = torch.searchsorted(
-                            keys_b, torch.tensor([val], device=keys_b.device, dtype=keys_b.dtype), right=True
-                        ).item()
-                        sel_idx = max(0, min(int(pos) - 1, Kb - 1))
-                        emb_b = t5_chunk_embeddings[b, sel_idx]
-                        msk_b = t5_chunk_mask[b, sel_idx]
-                        selected_emb_list.append(emb_b)
-                        selected_mask_list.append(msk_b)
-                    pos_t5 = torch.stack(selected_emb_list, dim=0)
-                    data_batch["t5_text_embeddings"] = pos_t5
-                    data_batch["t5_text_mask"] = torch.stack(selected_mask_list, dim=0)
-            else:
-                pos_t5 = data_batch["t5_text_embeddings"]
-            neg_t5 = data_batch["neg_t5_text_embeddings"]
+                    cam_chunk_t, intr_chunk_t = trajectory_stream.next_chunk(
+                        int(model.framepack_num_new_video_frames),
+                        chunk_index=int(ar_idx),
+                    )
+                    cam_chunk = cam_chunk_t.unsqueeze(0).to(
+                        dtype=torch.float32,
+                        device=model.tensor_kwargs.get("device", None),
+                    )
+                    intr_chunk = intr_chunk_t.unsqueeze(0).to(
+                        dtype=torch.float32,
+                        device=model.tensor_kwargs.get("device", None),
+                    )
 
-            step_out = pipeline.autoregressive_step(
-                cam_w2c_chunk=cam_chunk,
-                intrinsics_chunk=intr_chunk,
-                t5_text_embeddings=pos_t5,
-                neg_t5_text_embeddings=neg_t5,
-                is_last_step=ar_idx == num_iters - 1,
-            )
+                if "t5_chunk_keys" in data_batch:
+                    t5_chunk_embeddings = data_batch["t5_chunk_embeddings"]
+                    t5_chunk_mask = data_batch["t5_chunk_mask"]
+                    B = int(data_batch["t5_chunk_keys"].shape[0])
+                    if args.ablate_same_t5:
+                        pos_t5 = t5_chunk_embeddings[:, 0]
+                        data_batch["t5_text_embeddings"] = pos_t5
+                        data_batch["t5_text_mask"] = t5_chunk_mask[:, 0]
+                    else:
+                        last_hist_px_abs = ar_idx * model.framepack_num_new_video_frames + 1
+                        sample_frame_indices = data_batch["sample_frame_indices"]
+                        t5_chunk_keys = data_batch["t5_chunk_keys"]
+                        F_total = int(sample_frame_indices.shape[1])
+                        idx_clamped = min(max(0, last_hist_px_abs), F_total - 1)
+                        first_abs_idx_B = sample_frame_indices[:, idx_clamped].to(dtype=torch.long)
+                        selected_emb_list = []
+                        selected_mask_list = []
+                        for b in range(B):
+                            keys_b = t5_chunk_keys[b]
+                            Kb = int(keys_b.numel())
+                            val = int(first_abs_idx_B[b].item())
+                            pos = torch.searchsorted(
+                                keys_b, torch.tensor([val], device=keys_b.device, dtype=keys_b.dtype), right=True
+                            ).item()
+                            sel_idx = max(0, min(int(pos) - 1, Kb - 1))
+                            emb_b = t5_chunk_embeddings[b, sel_idx]
+                            msk_b = t5_chunk_mask[b, sel_idx]
+                            selected_emb_list.append(emb_b)
+                            selected_mask_list.append(msk_b)
+                        pos_t5 = torch.stack(selected_emb_list, dim=0)
+                        data_batch["t5_text_embeddings"] = pos_t5
+                        data_batch["t5_text_mask"] = torch.stack(selected_mask_list, dim=0)
+                else:
+                    pos_t5 = data_batch["t5_text_embeddings"]
+                neg_t5 = data_batch["neg_t5_text_embeddings"]
 
-            if step_out["abort"]:
-                break
+                step_out = pipeline.autoregressive_step(
+                    cam_w2c_chunk=cam_chunk,
+                    intrinsics_chunk=intr_chunk,
+                    t5_text_embeddings=pos_t5,
+                    neg_t5_text_embeddings=neg_t5,
+                    is_last_step=(num_iters is not None and ar_idx == num_iters - 1),
+                )
+
+                if trajectory_stream is not None and hasattr(trajectory_stream, "update_from_pipeline"):
+                    trajectory_stream.update_from_pipeline(pipeline)
+
+                if step_out["abort"]:
+                    break
+                if stream_output and step_out.get("new_frames") is not None:
+                    chunk_stem = os.path.join(stream_dir, f"chunk_{ar_idx + 1:04d}")
+                    chunk_video = (step_out["new_frames"][0].clamp(-1, 1) * 0.5 + 0.5).float().cpu()
+                    save_img_or_video(chunk_video, chunk_stem, fps=args.fps)
+                    if stream_preview_enabled:
+                        _write_stream_preview(
+                            chunk_video,
+                            stream_preview_dir,
+                            chunk_index=int(ar_idx) + 1,
+                            fps=int(args.fps),
+                        )
+                    stream_manifest.append(f"file '{os.path.basename(chunk_stem)}.mp4'\n")
+                    del chunk_video
+
+                    if trajectory_stream is not None and hasattr(trajectory_stream, "save_trajectory"):
+                        trajectory_stream.save_trajectory(os.path.join(stream_dir, "camera_path.npz"))
+
+                    export_every = int(getattr(args, "stream_export_map_every", 0) or 0)
+                    if export_every > 0 and ((int(ar_idx) + 1) % export_every == 0):
+                        map_path = os.path.join(stream_dir, f"map_{ar_idx + 1:04d}.ply")
+                        map_info = pipeline.export_sparse_map(
+                            map_path,
+                            max_points=int(getattr(args, "stream_map_max_points", 200000) or 200000),
+                        )
+                        latest_path = os.path.join(stream_dir, "map_latest.ply")
+                        if map_info["points"] > 0:
+                            pipeline.export_sparse_map(
+                                latest_path,
+                                max_points=int(getattr(args, "stream_map_max_points", 200000) or 200000),
+                            )
+                        stream_map_history.append(map_info)
+                        with open(os.path.join(stream_dir, "map_manifest.json"), "w", encoding="utf-8") as f:
+                            json.dump(stream_map_history, f, indent=2)
+        except KeyboardInterrupt:
+            log.info("[stream] Interrupted by user; writing manifest for completed chunks.", rank0_only=True)
+
+    if stream_output:
+        manifest_path = os.path.join(stream_dir, "concat.txt")
+        with open(manifest_path, "w") as f:
+            f.writelines(stream_manifest)
+        return {
+            "stream_dir": stream_dir,
+            "manifest": manifest_path,
+            "preview_manifest": os.path.join(stream_preview_dir, "manifest.json") if stream_preview_enabled else None,
+            "chunks": len(stream_manifest),
+            "use_pose": pipeline.use_pose,
+            "use_plucker": pipeline.use_plucker,
+        }
 
     return pipeline.build_outputs(da3_gs_export_stem, log_prefix)
