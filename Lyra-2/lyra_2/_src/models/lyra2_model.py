@@ -37,6 +37,14 @@ from lyra_2._src.datasets.forward_warp_utils_pytorch import (
     unproject_points,
     forward_warp_multiframes,
 )
+try:
+    from lyra_2._src.kernels.sparse3d_cache_triton import (
+        can_use_triton_sparse3d,
+        depth_to_world_points_triton,
+    )
+except Exception:
+    can_use_triton_sparse3d = None
+    depth_to_world_points_triton = None
 from lyra_2._src.datasets.plucker_embed_corrupter import (
     ray_condition,
 )
@@ -2534,10 +2542,14 @@ class Sparse3DCache:
         downsample: int = 4,
         store_device: str = "cuda",
         store_values: bool = False,
+        cache_kernel: str = "torch",
     ) -> None:
         self.downsample = int(downsample)
         self._store_device = str(store_device)
         self._store_values = bool(store_values)
+        self._cache_kernel = str(cache_kernel)
+        self._triton_fallback_logged = False
+        self._tilelang_fallback_logged = False
         self._world_points: list[torch.Tensor] = []  # each: [B, H', W', 3]
         self._latent_indices: list[int] = []        # latent index per entry
         self._frame_ids: list[int] = []             # original video frame id per entry
@@ -2559,14 +2571,89 @@ class Sparse3DCache:
         K[:, 1, 2] = K[:, 1, 2] * scale
         return K
 
-    def add(
+    def _build_world_points(
         self,
         depth_B_1_H_W: torch.Tensor,
         w2c_B_4_4: torch.Tensor,
         K_B_3_3: torch.Tensor,
-        latent_index: int,
-        frame_id: Optional[int] = None,
-    ) -> None:
+    ) -> torch.Tensor:
+        kernel = self._cache_kernel.lower()
+        if kernel not in {"auto", "torch", "triton", "tilelang"}:
+            raise ValueError(f"Unsupported Sparse3DCache cache_kernel='{self._cache_kernel}'")
+
+        if kernel == "triton":
+            can_use = (
+                can_use_triton_sparse3d is not None
+                and depth_to_world_points_triton is not None
+                and can_use_triton_sparse3d(depth_B_1_H_W, w2c_B_4_4, K_B_3_3, self.downsample)
+            )
+            if can_use:
+                try:
+                    return depth_to_world_points_triton(
+                        depth_B_1_H_W,
+                        w2c_B_4_4,
+                        K_B_3_3,
+                        self.downsample,
+                    )
+                except Exception as exc:
+                    if kernel == "triton":
+                        raise
+                    if not self._triton_fallback_logged:
+                        log.warning(f"Sparse3DCache Triton kernel failed; falling back to torch path: {exc}")
+                        self._triton_fallback_logged = True
+            elif kernel == "triton":
+                raise RuntimeError("Sparse3DCache Triton kernel requested but unsupported for these inputs.")
+
+        if kernel in {"auto", "tilelang"}:
+            try:
+                from lyra_2._src.kernels.sparse3d_cache_tilelang import (
+                    can_use_tilelang_sparse3d,
+                    depth_to_world_points_tilelang,
+                )
+            except Exception as exc:
+                if kernel == "tilelang":
+                    raise RuntimeError("Sparse3DCache TileLang kernel requested but TileLang is unavailable.") from exc
+                if not self._tilelang_fallback_logged:
+                    log.warning(f"Sparse3DCache TileLang import failed; falling back to torch path: {exc}")
+                    self._tilelang_fallback_logged = True
+            else:
+                can_use = can_use_tilelang_sparse3d(depth_B_1_H_W, w2c_B_4_4, K_B_3_3, self.downsample)
+                if can_use:
+                    try:
+                        return depth_to_world_points_tilelang(
+                            depth_B_1_H_W,
+                            w2c_B_4_4,
+                            K_B_3_3,
+                            self.downsample,
+                        )
+                    except Exception as exc:
+                        if kernel == "tilelang":
+                            raise
+                        if not self._tilelang_fallback_logged:
+                            log.warning(f"Sparse3DCache TileLang kernel failed; falling back to torch path: {exc}")
+                            self._tilelang_fallback_logged = True
+                elif kernel == "tilelang":
+                    raise RuntimeError("Sparse3DCache TileLang kernel requested but unsupported for these inputs.")
+
+        if kernel == "auto":
+            can_use = (
+                can_use_triton_sparse3d is not None
+                and depth_to_world_points_triton is not None
+                and can_use_triton_sparse3d(depth_B_1_H_W, w2c_B_4_4, K_B_3_3, self.downsample)
+            )
+            if can_use:
+                try:
+                    return depth_to_world_points_triton(
+                        depth_B_1_H_W,
+                        w2c_B_4_4,
+                        K_B_3_3,
+                        self.downsample,
+                    )
+                except Exception as exc:
+                    if not self._triton_fallback_logged:
+                        log.warning(f"Sparse3DCache Triton kernel failed; falling back to torch path: {exc}")
+                        self._triton_fallback_logged = True
+
         ds = self.downsample
         # Subsample depth and scale intrinsics accordingly
         depth_ds = depth_B_1_H_W[:, :, ::ds, ::ds]
@@ -2583,6 +2670,17 @@ class Sparse3DCache:
             mask=mask_valid,
             return_sparse=False,
         )  # [B, H', W', 3]
+        return world_pts
+
+    def add(
+        self,
+        depth_B_1_H_W: torch.Tensor,
+        w2c_B_4_4: torch.Tensor,
+        K_B_3_3: torch.Tensor,
+        latent_index: int,
+        frame_id: Optional[int] = None,
+    ) -> None:
+        world_pts = self._build_world_points(depth_B_1_H_W, w2c_B_4_4, K_B_3_3)
         if self._store_device == "cpu":
             world_pts = world_pts.detach().to("cpu", non_blocking=True)
         self._world_points.append(world_pts)
@@ -2667,20 +2765,7 @@ class Sparse3DCache:
         _w2c = w2c_B_4_4.to(compute_device)
         _K = K_B_3_3.to(compute_device)
 
-        ds = self.downsample
-        depth_ds = _depth[:, :, ::ds, ::ds]
-        scale = 1.0 / float(ds)
-        K_scaled = self._scale_intrinsics(_K, scale)
-        mask_valid = (depth_ds > 0)
-        world_pts: torch.Tensor = unproject_points(
-            depth=depth_ds,
-            w2c=_w2c,
-            intrinsic=K_scaled,
-            is_depth=True,
-            is_ftheta=False,
-            mask=mask_valid,
-            return_sparse=False,
-        )
+        world_pts = self._build_world_points(_depth, _w2c, _K)
         if self._store_device == "cpu":
             world_pts = world_pts.detach().to("cpu", non_blocking=True)
         self._world_points[idx] = world_pts

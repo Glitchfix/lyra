@@ -592,6 +592,7 @@ class Lyra2InferencePipeline:
                 downsample=4,
                 store_device=store_device,
                 store_values=True,
+                cache_kernel=getattr(args, "cache_kernel", "torch"),
             )
 
             mv_ids = getattr(args, "multiview_ids", None)

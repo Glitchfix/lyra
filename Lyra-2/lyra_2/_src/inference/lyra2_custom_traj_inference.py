@@ -894,6 +894,9 @@ def parse_arguments() -> argparse.Namespace:
                         help="Write per-frame preview images plus manifest.json for the GL free-roam viewer.")
     parser.add_argument("--stream_preview_dir", type=str, default=None,
                         help="Preview frame directory. Defaults to <stream_output_dir>/preview when enabled.")
+    parser.add_argument("--cache_kernel", type=str, default="torch", choices=["torch", "triton", "tilelang", "auto"],
+                        help="Sparse3DCache point-building backend. 'triton' and 'tilelang' fuse depth downsample, "
+                             "unprojection, and camera transform; 'auto' tries TileLang first, then Triton.")
     parser.add_argument("--pose_scale", type=float, default=1.1,
                         help="Scale factor applied to w2c translation vectors.")
     parser.add_argument("--wos_360_loops", type=float, default=1.0,
