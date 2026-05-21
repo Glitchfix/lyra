@@ -30,6 +30,9 @@ from lyra_2._src.networks.wan2pt1 import (
     Head,
     MLPProj,
     VideoRopePosition3DEmb,
+    gated_residual_add_inference,
+    modulated_layernorm_inference,
+    wan_profile_section,
 )
 from lyra_2._src.callbacks.model_weights_stats import WeightTrainingStat
 from lyra_2._src.modules.selective_activation_checkpoint import (
@@ -212,53 +215,59 @@ class Lyra2AttentionBlock(nn.Module):
         buffer: Optional[torch.Tensor] = None,
     ):
         assert e.dtype == torch.float32
-        with amp.autocast("cuda", dtype=torch.float32):
-            e = (self.modulation + e).chunk(6, dim=1)
+        with wan_profile_section("block.modulation"):
+            with amp.autocast("cuda", dtype=torch.float32):
+                e = (self.modulation + e).chunk(6, dim=1)
         assert e[0].dtype == torch.float32
 
         # Self-attention with optional camera injection
-        if camera is not None:
-            assert self.cam_encoder is not None
-            cam_emb = self.cam_encoder(camera)
-        else:
-            if self.cam_encoder is not None:
-                raise ValueError("cam_encoder is enabled but camera tokens are None")
-            cam_emb = 0
-        if buffer is not None:
-            if self.inject_kq_only:
-                validity = buffer[..., -1:]  # [B, L, 1]
-                buffer = buffer[..., :-1]
-            assert self.buffer_encoder is not None
-            if self.buffer_sincos_multires > 0:
-                buf_emb = self._encode_sincos_buffer(buffer)
+        with wan_profile_section("block.camera_buffer_encode"):
+            if camera is not None:
+                assert self.cam_encoder is not None
+                cam_emb = self.cam_encoder(camera)
             else:
-                buf_emb = self.buffer_encoder(buffer)
-            if self.inject_kq_only:
-                buf_emb = buf_emb * validity
-        else:
-            if self.buffer_sincos_multires > 0 and self.buffer_encoder is not None:
-                raise ValueError("buffer_sincos_multires>0 requires buffer tokens, but buffer is None")
-            buf_emb = 0
+                if self.cam_encoder is not None:
+                    raise ValueError("cam_encoder is enabled but camera tokens are None")
+                cam_emb = 0
+            if buffer is not None:
+                if self.inject_kq_only:
+                    validity = buffer[..., -1:]  # [B, L, 1]
+                    buffer = buffer[..., :-1]
+                assert self.buffer_encoder is not None
+                if self.buffer_sincos_multires > 0:
+                    buf_emb = self._encode_sincos_buffer(buffer)
+                else:
+                    buf_emb = self.buffer_encoder(buffer)
+                if self.inject_kq_only:
+                    buf_emb = buf_emb * validity
+            else:
+                if self.buffer_sincos_multires > 0 and self.buffer_encoder is not None:
+                    raise ValueError("buffer_sincos_multires>0 requires buffer tokens, but buffer is None")
+                buf_emb = 0
 
-        y = (self.norm1(x).float() * (1 + e[1]) + e[0]).type_as(x)
+        with wan_profile_section("block.norm1_mod"):
+            y = modulated_layernorm_inference(x, self.norm1, e[1], e[0])
 
         if self.inject_kq_only:
-            if isinstance(cam_emb, torch.Tensor) and isinstance(buf_emb, torch.Tensor) and not torch.is_grad_enabled():
-                kq_bias = cam_emb
-                kq_bias.add_(buf_emb)
-            else:
-                kq_bias = cam_emb + buf_emb
+            with wan_profile_section("block.kq_bias_build"):
+                if isinstance(cam_emb, torch.Tensor) and isinstance(buf_emb, torch.Tensor) and not torch.is_grad_enabled():
+                    kq_bias = cam_emb
+                    kq_bias.add_(buf_emb)
+                else:
+                    kq_bias = cam_emb + buf_emb
             if isinstance(kq_bias, (int, float)) and kq_bias == 0:
                 kq_bias = None
             if not torch.is_grad_enabled():
                 del cam_emb, buf_emb
-            y = self.self_attn(y, seq_lens, video_size, freqs, kq_bias=kq_bias)
+            with wan_profile_section("block.self_attn_total"):
+                y = self.self_attn(y, seq_lens, video_size, freqs, kq_bias=kq_bias)
         else:
-            y = self.self_attn(y + cam_emb + buf_emb, seq_lens, video_size, freqs)
+            with wan_profile_section("block.self_attn_total"):
+                y = self.self_attn(y + cam_emb + buf_emb, seq_lens, video_size, freqs)
 
         if not torch.is_grad_enabled():
-            y.mul_(e[2].type_as(y))
-            x.add_(y)
+            with wan_profile_section("block.self_residual"):
+                gated_residual_add_inference(x, y, e[2])
             del y
         else:
             with amp.autocast("cuda", dtype=torch.float32):
@@ -266,16 +275,22 @@ class Lyra2AttentionBlock(nn.Module):
 
         # cross-attn + ffn (same as base)
         def cross_attn_ffn(x, context, context_lens, e):
-            y = self.cross_attn(self.norm3(x), context, context_lens)
+            with wan_profile_section("block.cross_norm"):
+                cross_in = self.norm3(x)
+            with wan_profile_section("block.cross_attn_total"):
+                y = self.cross_attn(cross_in, context, context_lens)
             if not torch.is_grad_enabled():
                 x.add_(y)
                 del y
             else:
                 x = x + y
-            y = self._forward_ffn((self.norm2(x).float() * (1 + e[4]) + e[3]).type_as(x))
+            with wan_profile_section("block.norm2_mod"):
+                ffn_in = modulated_layernorm_inference(x, self.norm2, e[4], e[3])
+            with wan_profile_section("block.ffn_total"):
+                y = self._forward_ffn(ffn_in)
             if not torch.is_grad_enabled():
-                y.mul_(e[5].type_as(y))
-                x.add_(y)
+                with wan_profile_section("block.ffn_residual"):
+                    gated_residual_add_inference(x, y, e[5])
                 del y
             else:
                 with amp.autocast("cuda", dtype=torch.float32):
@@ -1000,15 +1015,16 @@ class Lyra2WanModel(WeightTrainingStat):
 
         assert self.clean_patch_embeddings is not None
 
-        x_tokens, freqs_tokens, camera_tokens, buffer_tokens, (gen_start, gen_end), (f_gen, h_gen, w_gen) = self._patchify_lyra2(
-            x_B_C_T_H_W,
-            framepack_indices,
-            framepack_splits,
-            framepack_kernel_ids,
-            framepack_kernel_types,
-            camera=camera_5d,
-            buffer_B_C_T_H_W=y_buffer_B_C_T_H_W,
-        )
+        with wan_profile_section("net.patchify_lyra2"):
+            x_tokens, freqs_tokens, camera_tokens, buffer_tokens, (gen_start, gen_end), (f_gen, h_gen, w_gen) = self._patchify_lyra2(
+                x_B_C_T_H_W,
+                framepack_indices,
+                framepack_splits,
+                framepack_kernel_ids,
+                framepack_kernel_types,
+                camera=camera_5d,
+                buffer_B_C_T_H_W=y_buffer_B_C_T_H_W,
+            )
         if not torch.is_grad_enabled():
             del x_B_C_T_H_W, camera_5d, y_buffer_B_C_T_H_W
             if torch.cuda.is_available():
@@ -1037,18 +1053,20 @@ class Lyra2WanModel(WeightTrainingStat):
                 )
                 buffer_tokens = split_inputs_cp(buffer_tokens, seq_dim=1, cp_group=cp_group)
 
-        with amp.autocast("cuda", dtype=torch.float32):
-            e_B_D = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t_B).float())
-            e0_B_6_D = self.time_projection(e_B_D).unflatten(1, (6, self.dim))
+        with wan_profile_section("net.time_embedding"):
+            with amp.autocast("cuda", dtype=torch.float32):
+                e_B_D = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t_B).float())
+                e0_B_6_D = self.time_projection(e_B_D).unflatten(1, (6, self.dim))
 
-        if crossattn_emb.dim() == 4:
-            crossattn_emb = crossattn_emb.squeeze(1)
-        context_B_L_D = self.text_embedding(crossattn_emb)
-        if frame_cond_crossattn_emb_B_L_D is not None:
-            context_clip = self.img_emb(frame_cond_crossattn_emb_B_L_D)
-            context_B_L_D = torch.concat([context_clip, context_B_L_D], dim=1)
-            if not torch.is_grad_enabled():
-                del context_clip, frame_cond_crossattn_emb_B_L_D
+        with wan_profile_section("net.context_embedding"):
+            if crossattn_emb.dim() == 4:
+                crossattn_emb = crossattn_emb.squeeze(1)
+            context_B_L_D = self.text_embedding(crossattn_emb)
+            if frame_cond_crossattn_emb_B_L_D is not None:
+                context_clip = self.img_emb(frame_cond_crossattn_emb_B_L_D)
+                context_B_L_D = torch.concat([context_clip, context_B_L_D], dim=1)
+                if not torch.is_grad_enabled():
+                    del context_clip, frame_cond_crossattn_emb_B_L_D
         if not torch.is_grad_enabled():
             del crossattn_emb
 
@@ -1078,25 +1096,28 @@ class Lyra2WanModel(WeightTrainingStat):
 
         x_B_L_D = x_tokens
         for block in self.blocks:
-            x_B_L_D = block(x_B_L_D, **kwargs_blocks)
+            with wan_profile_section("net.blocks_total"):
+                x_B_L_D = block(x_B_L_D, **kwargs_blocks)
 
-        x_B_L_D = self.head(x_B_L_D, e_B_D)
+        with wan_profile_section("net.head"):
+            x_B_L_D = self.head(x_B_L_D, e_B_D)
 
         if cp_enabled and cp_group is not None:
             x_B_L_D = cat_outputs_cp_with_grad(x_B_L_D, seq_dim=1, cp_group=cp_group)
 
-        x_gen = x_B_L_D[:, gen_start:gen_end]
-        x_B_C_T_H_W = rearrange(
-            x_gen,
-            "b (f h w) (pt ph pw c) -> b c (f pt) (h ph) (w pw)",
-            f=f_gen,
-            h=h_gen,
-            w=w_gen,
-            pt=self.patch_size[0],
-            ph=self.patch_size[1],
-            pw=self.patch_size[2],
-            c=self.out_dim,
-        )
+        with wan_profile_section("net.unpatchify"):
+            x_gen = x_B_L_D[:, gen_start:gen_end]
+            x_B_C_T_H_W = rearrange(
+                x_gen,
+                "b (f h w) (pt ph pw c) -> b c (f pt) (h ph) (w pw)",
+                f=f_gen,
+                h=h_gen,
+                w=w_gen,
+                pt=self.patch_size[0],
+                ph=self.patch_size[1],
+                pw=self.patch_size[2],
+                c=self.out_dim,
+            )
         return x_B_C_T_H_W
 
     def init_weights(self):

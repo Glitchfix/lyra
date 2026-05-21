@@ -22,7 +22,8 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
+from contextlib import contextmanager
 
 import cv2
 import numpy as np
@@ -37,6 +38,316 @@ from lyra_2._src.datasets.forward_warp_utils_pytorch import (
 )
 
 torch.enable_grad(False)
+
+_AR_PROFILE_STATS: dict[str, dict[str, float | int]] = {}
+
+
+def _ar_profile_enabled() -> bool:
+    return os.environ.get("LYRA2_PROFILE_WAN", "0") == "1" or os.environ.get("LYRA2_PROFILE_AR", "0") == "1"
+
+
+def _sync_cuda_for_profile() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+@contextmanager
+def ar_profile_section(name: str):
+    if not _ar_profile_enabled():
+        yield
+        return
+    _sync_cuda_for_profile()
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        _sync_cuda_for_profile()
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        item = _AR_PROFILE_STATS.setdefault(name, {"ms": 0.0, "calls": 0})
+        item["ms"] = float(item["ms"]) + elapsed_ms
+        item["calls"] = int(item["calls"]) + 1
+
+
+def _start_ar_profile_timer() -> float | None:
+    if not _ar_profile_enabled():
+        return None
+    _sync_cuda_for_profile()
+    return time.perf_counter()
+
+
+def _finish_ar_profile_timer(name: str, start: float | None) -> None:
+    if start is None:
+        return
+    _sync_cuda_for_profile()
+    elapsed_ms = (time.perf_counter() - start) * 1000.0
+    item = _AR_PROFILE_STATS.setdefault(name, {"ms": 0.0, "calls": 0})
+    item["ms"] = float(item["ms"]) + elapsed_ms
+    item["calls"] = int(item["calls"]) + 1
+
+
+def reset_ar_profile_stats() -> None:
+    _AR_PROFILE_STATS.clear()
+
+
+def get_ar_profile_stats() -> dict[str, dict[str, float | int]]:
+    return {name: dict(item) for name, item in _AR_PROFILE_STATS.items()}
+
+
+def _tensor_nbytes(t: torch.Tensor) -> int:
+    return int(t.numel()) * int(t.element_size())
+
+
+def _module_tensor_bytes(module) -> int:
+    seen: set[int] = set()
+    total = 0
+    for tensor in itertools.chain(module.parameters(recurse=True), module.buffers(recurse=True)):
+        if tensor is None:
+            continue
+        obj_id = id(tensor)
+        if obj_id in seen:
+            continue
+        seen.add(obj_id)
+        total += _tensor_nbytes(tensor)
+    return total
+
+
+class _PinnedTensorEntry:
+    __slots__ = ("name", "tensor", "host", "nbytes")
+
+    def __init__(self, name: str, tensor: torch.Tensor, host: torch.Tensor):
+        self.name = name
+        self.tensor = tensor
+        self.host = host
+        self.nbytes = _tensor_nbytes(host)
+
+
+class _PinnedDiffusionOffloader:
+    """Pinned host staging for selected diffusion tensors.
+
+    The weights are immutable during inference, so after the first GPU->pinned
+    copy we can evict by swapping parameter/buffer storage back to the pinned
+    CPU tensor, then restore with async pinned H2D copies.
+    """
+
+    def __init__(
+        self,
+        modules: Iterable[tuple[str, object]],
+        *,
+        device,
+        async_restore: bool = True,
+    ):
+        self.modules = list(modules)
+        self.device = torch.device(device)
+        self.async_restore = bool(async_restore and torch.cuda.is_available() and self.device.type == "cuda")
+        self.entries: list[_PinnedTensorEntry] = []
+        self.total_bytes = 0
+        self.ready = False
+        self.on_cpu = False
+        self.disabled = False
+        self.restore_stream = torch.cuda.Stream(device=self.device) if self.async_restore else None
+        self.pending_event: torch.cuda.Event | None = None
+
+    def _iter_tensors(self):
+        seen: set[int] = set()
+        for module_label, module in self.modules:
+            for name, tensor in itertools.chain(
+                module.named_parameters(recurse=True),
+                module.named_buffers(recurse=True),
+            ):
+                if tensor is None:
+                    continue
+                obj_id = id(tensor)
+                if obj_id in seen:
+                    continue
+                seen.add(obj_id)
+                yield f"{module_label}.{name}", tensor
+
+    def _pin_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.device.type == "cpu" and tensor.is_pinned():
+            return tensor.detach()
+        host = torch.empty_strided(
+            tuple(tensor.shape),
+            tuple(tensor.stride()),
+            device="cpu",
+            dtype=tensor.dtype,
+            pin_memory=True,
+        )
+        host.copy_(tensor.detach(), non_blocking=False)
+        return host
+
+    def _materialize_pinned_hosts(self) -> None:
+        entries: list[_PinnedTensorEntry] = []
+        for name, tensor in self._iter_tensors():
+            host = self._pin_tensor(tensor)
+            entries.append(_PinnedTensorEntry(name, tensor, host))
+        # Issue large DMA copies first on restore; tiny tensors then fill the gaps.
+        entries.sort(key=lambda item: item.nbytes, reverse=True)
+        self.entries = entries
+        self.total_bytes = sum(item.nbytes for item in entries)
+        self.ready = True
+
+    def _sync_before_storage_swap(self) -> None:
+        if torch.cuda.is_available() and self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+
+    def wait_for_restore(self, *, block: bool = False) -> None:
+        event = self.pending_event
+        if event is None:
+            return
+        if block:
+            event.synchronize()
+        else:
+            torch.cuda.current_stream(self.device).wait_event(event)
+        self.pending_event = None
+
+    def offload_to_cpu(self) -> bool:
+        if self.disabled:
+            return False
+        try:
+            self.wait_for_restore(block=True)
+            if self.on_cpu:
+                return True
+            if not self.ready:
+                self._materialize_pinned_hosts()
+            self._sync_before_storage_swap()
+            for item in self.entries:
+                item.tensor.data = item.host
+            self.on_cpu = True
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            return True
+        except Exception as exc:
+            self.disabled = True
+            self.entries = []
+            self.ready = False
+            self.pending_event = None
+            log.warning(
+                f"[offload] Pinned diffusion offload disabled after {type(exc).__name__}: {exc}",
+                rank0_only=True,
+            )
+            return False
+
+    def restore_to_gpu(self) -> bool:
+        if self.disabled:
+            return False
+        if not self.ready or not self.on_cpu:
+            return True
+        if self.device.type != "cuda" or not torch.cuda.is_available():
+            return False
+        try:
+            if self.async_restore:
+                assert self.restore_stream is not None
+                with torch.cuda.stream(self.restore_stream):
+                    for item in self.entries:
+                        gpu = torch.empty_strided(
+                            tuple(item.host.shape),
+                            tuple(item.host.stride()),
+                            device=self.device,
+                            dtype=item.host.dtype,
+                        )
+                        gpu.copy_(item.host, non_blocking=True)
+                        item.tensor.data = gpu
+                    event = torch.cuda.Event()
+                    event.record(self.restore_stream)
+                    self.pending_event = event
+            else:
+                for item in self.entries:
+                    gpu = torch.empty_strided(
+                        tuple(item.host.shape),
+                        tuple(item.host.stride()),
+                        device=self.device,
+                        dtype=item.host.dtype,
+                    )
+                    gpu.copy_(item.host, non_blocking=True)
+                    item.tensor.data = gpu
+            self.on_cpu = False
+            return True
+        except Exception as exc:
+            self.disabled = True
+            log.warning(
+                f"[offload] Pinned diffusion restore disabled after {type(exc).__name__}: {exc}",
+                rank0_only=True,
+            )
+            return False
+
+
+def _select_diffusion_offload_modules(model) -> tuple[list[tuple[str, object]], int, str]:
+    net = model.net
+    target_gib = float(getattr(model, "_lyra2_diffusion_offload_target_gib", 0.0) or 0.0)
+    strategy = str(getattr(model, "_lyra2_diffusion_offload_strategy", "tail_blocks") or "tail_blocks")
+    target_bytes = int(target_gib * (1024 ** 3))
+
+    if target_bytes > 0 and strategy == "tail_blocks" and hasattr(net, "blocks"):
+        selected: list[tuple[str, object]] = []
+        total = 0
+        blocks = list(enumerate(net.blocks))
+        for block_idx, block in reversed(blocks):
+            selected.append((f"net.blocks.{block_idx}", block))
+            total += _module_tensor_bytes(block)
+            if total >= target_bytes:
+                break
+        selected.reverse()
+        return selected, total, f"tail_blocks target={target_gib:.2f}GiB"
+
+    total = _module_tensor_bytes(net)
+    return [("net", net)], total, "full_net"
+
+
+def configure_diffusion_offload(model, args=None) -> None:
+    """Configure optional pinned/partial diffusion offload from CLI args."""
+    if args is None:
+        return
+    pinned = bool(getattr(args, "pinned_diffusion_offload", False))
+    target_gib = float(getattr(args, "diffusion_offload_gb", 0.0) or 0.0)
+    if target_gib > 0.0:
+        pinned = True
+    model._lyra2_pinned_diffusion_offload = pinned
+    model._lyra2_diffusion_offload_target_gib = target_gib
+    model._lyra2_diffusion_offload_strategy = str(
+        getattr(args, "diffusion_offload_strategy", "tail_blocks") or "tail_blocks"
+    )
+    model._lyra2_diffusion_offload_async_restore = bool(
+        getattr(args, "diffusion_offload_async_restore", True)
+    )
+    if hasattr(model, "_lyra2_diffusion_offloader"):
+        delattr(model, "_lyra2_diffusion_offloader")
+
+    if pinned and hasattr(model, "net"):
+        modules, total_bytes, desc = _select_diffusion_offload_modules(model)
+        labels = [label for label, _ in modules]
+        if len(labels) > 8:
+            label_text = f"{labels[0]}..{labels[-1]} ({len(labels)} modules)"
+        else:
+            label_text = ", ".join(labels)
+        log.info(
+            f"[offload] Configured pinned diffusion offload: {desc}, "
+            f"selected={total_bytes / (1024 ** 3):.2f}GiB, modules={label_text}, "
+            f"async_restore={model._lyra2_diffusion_offload_async_restore}",
+            rank0_only=True,
+        )
+
+
+def _get_pinned_diffusion_offloader(model) -> _PinnedDiffusionOffloader | None:
+    if not bool(getattr(model, "_lyra2_pinned_diffusion_offload", False)):
+        return None
+    if not hasattr(model, "net"):
+        return None
+    manager = getattr(model, "_lyra2_diffusion_offloader", None)
+    if manager is None:
+        modules, _total_bytes, _desc = _select_diffusion_offload_modules(model)
+        manager = _PinnedDiffusionOffloader(
+            modules,
+            device=model.tensor_kwargs.get("device", "cuda"),
+            async_restore=bool(getattr(model, "_lyra2_diffusion_offload_async_restore", True)),
+        )
+        model._lyra2_diffusion_offloader = manager
+    return manager
+
+
+def _wait_for_diffusion_restore(model, *, block: bool = False) -> None:
+    manager = getattr(model, "_lyra2_diffusion_offloader", None)
+    if manager is not None:
+        manager.wait_for_restore(block=block)
 
 
 def _atomic_write_json(path: str | os.PathLike[str], payload: dict) -> None:
@@ -115,11 +426,12 @@ def _prime_encoder_cache_with_history(init_video, vae_wrap, vae_core, model=None
 
     # Fresh encode using model helpers, then clone caches and normalize
     vae_core.clear_cache()
-    with vae_wrap.context:
-        video_cast = init_video.to(vae_wrap.dtype) if not vae_wrap.is_amp else init_video
-        feats = model._vae_encode_range_stream(video_cast, 0, video_cast.shape[2], skip_first_frame=False)
-        enc_feat_cache = model._clone_vae_cache(vae_core._enc_feat_map)
-        history_latents = model._encoder_feats_to_normalized_latents(feats).contiguous().to(init_video.dtype)
+    with ar_profile_section("ar.vae.prime_encode_core"):
+        with vae_wrap.context:
+            video_cast = init_video.to(vae_wrap.dtype) if not vae_wrap.is_amp else init_video
+            feats = model._vae_encode_range_stream(video_cast, 0, video_cast.shape[2], skip_first_frame=False)
+            enc_feat_cache = model._clone_vae_cache(vae_core._enc_feat_map)
+            history_latents = model._encoder_feats_to_normalized_latents(feats).contiguous().to(init_video.dtype)
 
     # Restore diffusion model to GPU after VAE operations
     _restore_diffusion_to_gpu(model, enable_offload)
@@ -127,7 +439,16 @@ def _prime_encoder_cache_with_history(init_video, vae_wrap, vae_core, model=None
     return history_latents, enc_feat_cache
 
 
-def _decode_new_latent_chunk(vae_wrap, vae_core, dec_feat_cache, latent_chunk, latent_offset, model=None, enable_offload=False):
+def _decode_new_latent_chunk(
+    vae_wrap,
+    vae_core,
+    dec_feat_cache,
+    latent_chunk,
+    latent_offset,
+    model=None,
+    enable_offload=False,
+    restore_after: bool = True,
+):
     """Stream-decode new latent chunk given current decoder cache; return pixel frames for this chunk."""
     # Offload diffusion model to CPU before VAE operations
     _offload_diffusion_to_cpu(model, enable_offload)
@@ -146,20 +467,22 @@ def _decode_new_latent_chunk(vae_wrap, vae_core, dec_feat_cache, latent_chunk, l
         z = mu / inv_std_c.view(1, vae_core.z_dim, 1, 1, 1).type_as(mu) + mean_c.view(1, vae_core.z_dim, 1, 1, 1).type_as(mu)
     else:
         z = mu / inv_std_c + mean_c
-    with vae_wrap.context:
-        if not vae_wrap.is_amp:
-            z = z.to(vae_wrap.dtype)
-        x = vae_core.conv2(z)
-        # Decode one temporal slice at a time to mirror encoder streaming and keep memory low
-        outs = []
-        for t in range(T_new):
-            feat_idx = [0]
-            out_t = vae_core.decoder(x[:, :, t : t + 1, :, :], feat_cache=dec_feat_cache, feat_idx=feat_idx)
-            outs.append(out_t)
-        video_chunk = torch.cat(outs, dim=2)
+    with ar_profile_section("ar.vae.decode_core"):
+        with vae_wrap.context:
+            if not vae_wrap.is_amp:
+                z = z.to(vae_wrap.dtype)
+            x = vae_core.conv2(z)
+            # Decode one temporal slice at a time to mirror encoder streaming and keep memory low
+            outs = []
+            for t in range(T_new):
+                feat_idx = [0]
+                out_t = vae_core.decoder(x[:, :, t : t + 1, :, :], feat_cache=dec_feat_cache, feat_idx=feat_idx)
+                outs.append(out_t)
+            video_chunk = torch.cat(outs, dim=2)
 
-    # Restore diffusion model to GPU after VAE operations
-    _restore_diffusion_to_gpu(model, enable_offload)
+    # Restore diffusion model to GPU after VAE operations, unless the caller is
+    # chaining another VAE/offloaded phase immediately.
+    _restore_diffusion_to_gpu(model, enable_offload and restore_after)
 
     return video_chunk
 
@@ -370,29 +693,39 @@ def _intrinsics_vec_to_k33(intrinsics_vec: torch.Tensor) -> torch.Tensor:
 def _offload_diffusion_to_cpu(model, enable_offload: bool):
     """Move diffusion model to CPU if offload is enabled."""
     if enable_offload and hasattr(model, 'net'):
-        model.net.cpu()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        with ar_profile_section("ar.offload.diffusion_to_cpu"):
+            manager = _get_pinned_diffusion_offloader(model)
+            if manager is not None and manager.offload_to_cpu():
+                return
+            model.net.cpu()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 
 def _restore_diffusion_to_gpu(model, enable_offload: bool):
     """Move diffusion model back to GPU if offload is enabled."""
     if enable_offload and hasattr(model, 'net'):
-        model.net.to(model.tensor_kwargs.get("device", "cuda"))
+        with ar_profile_section("ar.offload.diffusion_to_gpu_restore"):
+            manager = _get_pinned_diffusion_offloader(model)
+            if manager is not None and manager.restore_to_gpu():
+                return
+            model.net.to(model.tensor_kwargs.get("device", "cuda"))
 
 
 def _offload_module_to_cpu(module, enable_offload: bool):
     """Move an auxiliary module to CPU when low-VRAM offload is enabled."""
     if enable_offload and module is not None and hasattr(module, "to"):
-        module.to("cpu")
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        with ar_profile_section(f"ar.offload.{module.__class__.__name__}_to_cpu"):
+            module.to("cpu")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 
 def _restore_module_to_device(module, enable_offload: bool, device):
     """Move an auxiliary module back to the requested device when needed."""
     if enable_offload and module is not None and hasattr(module, "to"):
-        module.to(device)
+        with ar_profile_section(f"ar.offload.{module.__class__.__name__}_to_device"):
+            module.to(device)
 
 
 def safe_to(obj, device=None, dtype=None, skip_keys: set | None = None):
@@ -490,8 +823,9 @@ class Lyra2InferencePipeline:
         self.first_frame = first_frame[:, :, :1].detach()
         self.history_frames = init_video
         _, self.vae_wrap, self.vae_core = _get_vae_handles(model)
+        use_vae_offload = bool(getattr(args, "offload", False) or getattr(args, "offload_vae", False))
         self.history_latents, self.enc_feat_cache = _prime_encoder_cache_with_history(
-            init_video, self.vae_wrap, self.vae_core, model, args.offload
+            init_video, self.vae_wrap, self.vae_core, model, use_vae_offload
         )
         # Align latent dtype/device to model tensor kwargs for downstream layers.
         self.history_latents = misc.to(self.history_latents, **self.model.tensor_kwargs)
@@ -504,7 +838,7 @@ class Lyra2InferencePipeline:
             self.history_latents,
             latent_offset=0,
             model=model,
-            enable_offload=args.offload,
+            enable_offload=use_vae_offload,
         )
         self.first_latent = self.history_latents[:, :, :1]
         self.history_frame_ids: List[int] = [0]
@@ -944,186 +1278,211 @@ class Lyra2InferencePipeline:
         neg_t5_text_embeddings=None,
         is_last_step=False,
     ):
-        self._append_cameras(cam_w2c_chunk, intrinsics_chunk)
-        start_px_idx = 1 + self.ar_idx * self.model.framepack_num_new_video_frames
-        end_px_idx = start_px_idx + self.model.framepack_num_new_video_frames
+        step_timer = _start_ar_profile_timer()
+        with ar_profile_section("ar.prepare_history_inputs"):
+            self._append_cameras(cam_w2c_chunk, intrinsics_chunk)
+            start_px_idx = 1 + self.ar_idx * self.model.framepack_num_new_video_frames
+            end_px_idx = start_px_idx + self.model.framepack_num_new_video_frames
 
-        total_latents_now = int(self.history_latents.shape[2])
-        # Use cached counts computed in model._init_lyra2_metadata.
-        num_temporal_hist = int(self.model.framepack_num_temporal_hist)
-        num_spatial_hist = int(self.model.framepack_num_spatial_hist)
+            total_latents_now = int(self.history_latents.shape[2])
+            # Use cached counts computed in model._init_lyra2_metadata.
+            num_temporal_hist = int(self.model.framepack_num_temporal_hist)
+            num_spatial_hist = int(self.model.framepack_num_spatial_hist)
 
-        temporal_selected: List[int] = self.model._select_temporal_history_indices(total_latents_now, num_temporal_hist)
+            temporal_selected: List[int] = self.model._select_temporal_history_indices(total_latents_now, num_temporal_hist)
 
-        cfg = self.model.config
-        use_image_spatial = bool(cfg.spatial_memory_use_image)
+            cfg = self.model.config
+            use_image_spatial = bool(cfg.spatial_memory_use_image)
 
-        # Move history latents to the model device/dtype for selection/inference.
-        history_full = misc.to(self.history_latents, **self.model.tensor_kwargs)
-        # Unified input preparation: reuse Lyra2Model._prepare_lyra2_inputs.
-        # For now we only support pose-conditioned inference here.
-        assert self.retrieval_cache is not None, "retrieval_cache must be initialized for pose mode."
-        assert self.buffer_depth_latest is not None, "buffer_depth_latest must be initialized for pose mode."
+            # Move history latents to the model device/dtype for selection/inference.
+            history_full = misc.to(self.history_latents, **self.model.tensor_kwargs)
+            # Unified input preparation: reuse Lyra2Model._prepare_lyra2_inputs.
+            # For now we only support pose-conditioned inference here.
+            assert self.retrieval_cache is not None, "retrieval_cache must be initialized for pose mode."
+            assert self.buffer_depth_latest is not None, "buffer_depth_latest must be initialized for pose mode."
 
-        device = history_full.device
-        video_hist_abs = self.history_frames[:, :, self.start_index : ]
-        video_all = misc.to(video_hist_abs, **self.model.tensor_kwargs)
-        video_frame_ids_t = torch.tensor(self.history_frame_ids, device=device, dtype=torch.long)
-        video_indices_t = self._build_video_indices(int(end_px_idx), device)
+            device = history_full.device
+            video_hist_abs = self.history_frames[:, :, self.start_index : ]
+            video_all = misc.to(video_hist_abs, **self.model.tensor_kwargs)
+            video_frame_ids_t = torch.tensor(self.history_frame_ids, device=device, dtype=torch.long)
+            video_indices_t = self._build_video_indices(int(end_px_idx), device)
 
-        # Dummy generation tail; `_prepare_lyra2_inputs()` overwrites it with pose conditioning.
-        B, C_lat, _T_hist, H_lat, W_lat = history_full.shape
-        T_new_lat = int(self.model.framepack_num_new_latent_frames)
-        gen_cond_dummy = torch.zeros((B, C_lat, T_new_lat, H_lat, W_lat), device=device, dtype=history_full.dtype)
+            # Dummy generation tail; `_prepare_lyra2_inputs()` overwrites it with pose conditioning.
+            B, C_lat, _T_hist, H_lat, W_lat = history_full.shape
+            T_new_lat = int(self.model.framepack_num_new_latent_frames)
+            gen_cond_dummy = torch.zeros((B, C_lat, T_new_lat, H_lat, W_lat), device=device, dtype=history_full.dtype)
 
-        # Buffer depth (most recent history pixel frame) for warping.
-        buffer_depth = self.buffer_depth_latest.to(device=device, dtype=torch.float32)
-        if buffer_depth.dim() == 3:
-            buffer_depth = buffer_depth.unsqueeze(1)
+            # Buffer depth (most recent history pixel frame) for warping.
+            buffer_depth = self.buffer_depth_latest.to(device=device, dtype=torch.float32)
+            if buffer_depth.dim() == 3:
+                buffer_depth = buffer_depth.unsqueeze(1)
 
-        # Keep original skip behavior from the previous implementation.
-        spatial_cache_skip_last_n = 0
+            # Keep original skip behavior from the previous implementation.
+            spatial_cache_skip_last_n = 0
 
         # Collect warped pixels for visualization only when requested.
         prev_collect = bool(getattr(self.model, "_collect_return_condition_state", False))
-        _offload_diffusion_to_cpu(self.model, self.args.offload)
-        try:
-            self.model._collect_return_condition_state = self.save_warp_video
-            latents_full, cond_latent, _mask, buffer_cond_latents = self.model._prepare_lyra2_inputs(
-            history_full=history_full,
-            gen_cond=gen_cond_dummy,
-            spatial_cache=self.retrieval_cache,
-            video=video_all,
-            video_frame_ids=video_frame_ids_t,
-            buffer_depth_B_1_H_W=buffer_depth,
-            camera_w2c=self.cam_w2c,
-            intrinsics=self.intrinsics,
-            video_indices=video_indices_t,
-            is_training=False,
-            spatial_cache_skip_last_n=int(spatial_cache_skip_last_n),
-            num_retrieval_views=self.num_retrieval_views,
+        with ar_profile_section("ar.prepare_lyra2_inputs"):
+            conditioning_offload = bool(
+                getattr(self.args, "offload", False)
+                or getattr(self.args, "offload_conditioning", False)
             )
-        finally:
-            self.model._collect_return_condition_state = prev_collect
-        gc.collect()
-        torch.cuda.empty_cache()
-        warp_pixels = getattr(self.model, "_latest_condition_state_pixels", None)
-        if self.save_warp_video and self.use_pose and warp_pixels is not None:
-            if isinstance(warp_pixels, torch.Tensor) and warp_pixels.dim() == 5:
-                if int(warp_pixels.shape[1]) > 3:
-                    warp_pixels = warp_pixels[:, :3]
-            self.warp_video_collect.append(warp_pixels.detach().float().cpu())
-        history_window = latents_full[:, :, : -T_new_lat].contiguous()
-        del latents_full, history_full, video_all, gen_cond_dummy, buffer_depth
-        if torch.cuda.is_available():
+            _offload_diffusion_to_cpu(self.model, conditioning_offload)
+            try:
+                self.model._collect_return_condition_state = self.save_warp_video
+                latents_full, cond_latent, _mask, buffer_cond_latents = self.model._prepare_lyra2_inputs(
+                history_full=history_full,
+                gen_cond=gen_cond_dummy,
+                spatial_cache=self.retrieval_cache,
+                video=video_all,
+                video_frame_ids=video_frame_ids_t,
+                buffer_depth_B_1_H_W=buffer_depth,
+                camera_w2c=self.cam_w2c,
+                intrinsics=self.intrinsics,
+                video_indices=video_indices_t,
+                is_training=False,
+                spatial_cache_skip_last_n=int(spatial_cache_skip_last_n),
+                num_retrieval_views=self.num_retrieval_views,
+                )
+            finally:
+                self.model._collect_return_condition_state = prev_collect
+            gc.collect()
             torch.cuda.empty_cache()
+            warp_pixels = getattr(self.model, "_latest_condition_state_pixels", None)
+            if self.save_warp_video and self.use_pose and warp_pixels is not None:
+                if isinstance(warp_pixels, torch.Tensor) and warp_pixels.dim() == 5:
+                    if int(warp_pixels.shape[1]) > 3:
+                        warp_pixels = warp_pixels[:, :3]
+                self.warp_video_collect.append(warp_pixels.detach().float().cpu())
+            history_window = latents_full[:, :, : -T_new_lat].contiguous()
+            del latents_full, history_full, video_all, gen_cond_dummy, buffer_depth
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
+        _restore_diffusion_to_gpu(self.model, bool(getattr(self.args, "offload_conditioning", False)))
         self._restore_model_to_gpu()
-        pos_text, neg_text = self._prepare_text_embeddings(t5_text_embeddings, neg_t5_text_embeddings)
-        last_hist_frame_cast = misc.to(self.last_hist_frame, **self.model.tensor_kwargs)
-        padding_mask_cast = misc.to(self.padding_mask, **self.model.tensor_kwargs) if self.padding_mask is not None else None
-        if not self.args.use_dmd_scheduler:
-            gen_chunk = self.model.inference(
-                history_latents=history_window,
-                cond_latent=cond_latent,
-                cond_latent_mask=_mask,
-                cond_latent_buffer=buffer_cond_latents,
-                guidance=self.args.guidance,
-                seed=int(self.args.seed + self.ar_idx),
-                num_steps=self.args.num_sampling_step,
-                shift=self.args.shift,
-                t5_text_embeddings=pos_text,
-                neg_t5_text_embeddings=neg_text,
-                last_hist_frame=last_hist_frame_cast,
-                fps=self.fps,
-                padding_mask=padding_mask_cast,
-            )
-        else:
-            gen_chunk = self.model.inference_dmd(
-                history_latents=history_window,
-                cond_latent=cond_latent,
-                cond_latent_mask=_mask,
-                cond_latent_buffer=buffer_cond_latents,
-                guidance=self.args.guidance,
-                seed=int(self.args.seed + self.ar_idx),
-                num_steps=self.args.num_sampling_step,
-                shift=self.args.shift,
-                t5_text_embeddings=pos_text,
-                neg_t5_text_embeddings=neg_text,
-                last_hist_frame=last_hist_frame_cast,
-                fps=self.fps,
-                padding_mask=padding_mask_cast,
-            )
+        with ar_profile_section("ar.prepare_denoise_inputs"):
+            pos_text, neg_text = self._prepare_text_embeddings(t5_text_embeddings, neg_t5_text_embeddings)
+            last_hist_frame_cast = misc.to(self.last_hist_frame, **self.model.tensor_kwargs)
+            padding_mask_cast = misc.to(self.padding_mask, **self.model.tensor_kwargs) if self.padding_mask is not None else None
+        _wait_for_diffusion_restore(self.model)
+        with ar_profile_section("ar.denoise_total"):
+            if not self.args.use_dmd_scheduler:
+                gen_chunk = self.model.inference(
+                    history_latents=history_window,
+                    cond_latent=cond_latent,
+                    cond_latent_mask=_mask,
+                    cond_latent_buffer=buffer_cond_latents,
+                    guidance=self.args.guidance,
+                    seed=int(self.args.seed + self.ar_idx),
+                    num_steps=self.args.num_sampling_step,
+                    shift=self.args.shift,
+                    t5_text_embeddings=pos_text,
+                    neg_t5_text_embeddings=neg_text,
+                    last_hist_frame=last_hist_frame_cast,
+                    fps=self.fps,
+                    padding_mask=padding_mask_cast,
+                )
+            else:
+                gen_chunk = self.model.inference_dmd(
+                    history_latents=history_window,
+                    cond_latent=cond_latent,
+                    cond_latent_mask=_mask,
+                    cond_latent_buffer=buffer_cond_latents,
+                    guidance=self.args.guidance,
+                    seed=int(self.args.seed + self.ar_idx),
+                    num_steps=self.args.num_sampling_step,
+                    shift=self.args.shift,
+                    t5_text_embeddings=pos_text,
+                    neg_t5_text_embeddings=neg_text,
+                    last_hist_frame=last_hist_frame_cast,
+                    fps=self.fps,
+                    padding_mask=padding_mask_cast,
+                )
         gen_chunk = gen_chunk[:, :, :self.model.framepack_num_new_latent_frames]
-        new_generated_frames = _decode_new_latent_chunk(
-            self.vae_wrap,
-            self.vae_core,
-            self.dec_feat_cache,
-            gen_chunk,
-            latent_offset=self.history_latents.shape[2],
-            model=self.model,
-            enable_offload=self.args.offload,
+        vae_offload = bool(
+            getattr(self.args, "offload", False)
+            or getattr(self.args, "offload_vae", False)
         )
-        if self.args.offload:
-            self.history_frames = torch.cat(
-                [self.history_frames, new_generated_frames.to(self.history_frames.dtype).cpu()],
-                dim=2,
+        with ar_profile_section("ar.vae.decode_total"):
+            new_generated_frames = _decode_new_latent_chunk(
+                self.vae_wrap,
+                self.vae_core,
+                self.dec_feat_cache,
+                gen_chunk,
+                latent_offset=self.history_latents.shape[2],
+                model=self.model,
+                enable_offload=vae_offload,
+                restore_after=not vae_offload,
             )
-        else:
-            self.history_frames = torch.cat(
-                [self.history_frames, new_generated_frames.to(self.history_frames.dtype)],
-                dim=2,
-            )
-        new_frame_ids = list(range(int(start_px_idx), int(end_px_idx)))
-        self.history_frame_ids.extend(new_frame_ids)
+        with ar_profile_section("ar.history_frames_append"):
+            if self.args.offload:
+                self.history_frames = torch.cat(
+                    [self.history_frames, new_generated_frames.to(self.history_frames.dtype).cpu()],
+                    dim=2,
+                )
+            else:
+                self.history_frames = torch.cat(
+                    [self.history_frames, new_generated_frames.to(self.history_frames.dtype)],
+                    dim=2,
+                )
+            new_frame_ids = list(range(int(start_px_idx), int(end_px_idx)))
+            self.history_frame_ids.extend(new_frame_ids)
 
-        _offload_diffusion_to_cpu(self.model, self.args.offload)
-        with self.vae_wrap.context:
-            px_cast = new_generated_frames.to(self.vae_wrap.dtype) if not self.vae_wrap.is_amp else new_generated_frames
-            feats_gen, enc_cache_out = self.model.vae_encode_with_cache(
-                enc_cache=self.enc_feat_cache,
-                video=px_cast,
-                start_t=0,
-                end_t=px_cast.shape[2],
-                return_cache=True,
+        with ar_profile_section("ar.vae.reencode_total"):
+            _offload_diffusion_to_cpu(self.model, vae_offload)
+            with self.vae_wrap.context:
+                px_cast = new_generated_frames.to(self.vae_wrap.dtype) if not self.vae_wrap.is_amp else new_generated_frames
+                feats_gen, enc_cache_out = self.model.vae_encode_with_cache(
+                    enc_cache=self.enc_feat_cache,
+                    video=px_cast,
+                    start_t=0,
+                    end_t=px_cast.shape[2],
+                    return_cache=True,
+                )
+                self.enc_feat_cache[:] = enc_cache_out
+                gen_chunk_reencoded = self.model._encoder_feats_to_normalized_latents(feats_gen).to(self.history_latents.dtype)
+            _restore_diffusion_to_gpu(self.model, bool(getattr(self.args, "offload_vae", False)))
+            self._restore_model_to_gpu()
+        with ar_profile_section("ar.history_latents_append"):
+            if self.args.offload:
+                self.history_latents = torch.cat(
+                    [self.history_latents, gen_chunk_reencoded.to(self.history_latents.dtype).cpu()],
+                    dim=2,
+                )
+            else:
+                self.history_latents = torch.cat(
+                    [self.history_latents, gen_chunk_reencoded.to(self.history_latents.dtype)],
+                    dim=2,
+                )
+            new_latent_ids = list(
+                range(
+                    int(start_px_idx) + int(self.frames_per_latent) - 1,
+                    int(end_px_idx),
+                    int(self.frames_per_latent),
+                )
             )
-            self.enc_feat_cache[:] = enc_cache_out
-            gen_chunk_reencoded = self.model._encoder_feats_to_normalized_latents(feats_gen).to(self.history_latents.dtype)
-        self._restore_model_to_gpu()
-        if self.args.offload:
-            self.history_latents = torch.cat(
-                [self.history_latents, gen_chunk_reencoded.to(self.history_latents.dtype).cpu()],
-                dim=2,
+            self.history_latent_frame_ids.extend(new_latent_ids[: int(gen_chunk_reencoded.shape[2])])
+            self.last_hist_frame = new_generated_frames[:, :, -1]
+            self.tokens_generated += self.model.framepack_num_new_latent_frames
+        with ar_profile_section("ar.stream_frame_copy"):
+            stream_frames = (
+                new_generated_frames.detach().float().cpu()
+                if bool(getattr(self.args, "stream_output_chunks", False))
+                else None
             )
-        else:
-            self.history_latents = torch.cat(
-                [self.history_latents, gen_chunk_reencoded.to(self.history_latents.dtype)],
-                dim=2,
-            )
-        new_latent_ids = list(
-            range(
-                int(start_px_idx) + int(self.frames_per_latent) - 1,
-                int(end_px_idx),
-                int(self.frames_per_latent),
-            )
-        )
-        self.history_latent_frame_ids.extend(new_latent_ids[: int(gen_chunk_reencoded.shape[2])])
-        self.last_hist_frame = new_generated_frames[:, :, -1]
-        self.tokens_generated += self.model.framepack_num_new_latent_frames
-        stream_frames = (
-            new_generated_frames.detach().float().cpu()
-            if bool(getattr(self.args, "stream_output_chunks", False))
-            else None
-        )
 
         if self.use_pose and not is_last_step:
-            self._update_depth_cache(end_px_idx)
-        self._trim_history_ring()
-        del gen_chunk, new_generated_frames, gen_chunk_reencoded
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            with ar_profile_section("ar.depth_update_total"):
+                self._update_depth_cache(end_px_idx)
+        with ar_profile_section("ar.trim_cleanup"):
+            self._trim_history_ring()
+            del gen_chunk, new_generated_frames, gen_chunk_reencoded
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         self.ar_idx += 1
+        _finish_ar_profile_timer("ar.step_total", step_timer)
         return {"abort": False, "new_frames": stream_frames}
 
     def _restore_model_to_gpu(self):

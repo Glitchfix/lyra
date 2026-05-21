@@ -46,6 +46,7 @@ from lyra_2._src.inference.lyra2_ar_inference import (
     _offload_module_to_cpu,
     _restore_diffusion_to_gpu,
     _restore_module_to_device,
+    configure_diffusion_offload,
     save_output,
     safe_to,
     run_lyra2_sample,
@@ -897,6 +898,20 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--cache_kernel", type=str, default="torch", choices=["torch", "triton", "tilelang", "auto"],
                         help="Sparse3DCache point-building backend. 'triton' and 'tilelang' fuse depth downsample, "
                              "unprojection, and camera transform; 'auto' tries TileLang first, then Triton.")
+    parser.add_argument("--tilelang_mlp", action="store_true",
+                        help="Replace inference-time tanh GELU in WAN/Lyra MLPs with an in-place TileLang kernel.")
+    parser.add_argument("--tilelang_mlp_min_elements", type=int, default=16_000_000,
+                        help="Minimum GELU activation elements before --tilelang_mlp uses the TileLang kernel.")
+    parser.add_argument("--tilelang_mlp_block_size", type=int, default=512,
+                        help="CUDA threads per block for the TileLang MLP GELU kernel.")
+    parser.add_argument("--tilelang_attention_norm", action="store_true",
+                        help="Use TileLang for inference-time WanRMSNorm in attention Q/K normalization.")
+    parser.add_argument("--tilelang_modulated_norm", action="store_true",
+                        help="Fuse inference-time WanLayerNorm plus timestep modulation with TileLang.")
+    parser.add_argument("--tilelang_gated_residual", action="store_true",
+                        help="Fuse inference-time gated residual updates x += y * gate with TileLang.")
+    parser.add_argument("--profile_wan", action="store_true",
+                        help="Collect synchronized CUDA timing for WAN/Lyra2 transformer sections.")
     parser.add_argument("--pose_scale", type=float, default=1.1,
                         help="Scale factor applied to w2c translation vectors.")
     parser.add_argument("--wos_360_loops", type=float, default=1.0,
@@ -953,11 +968,57 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--lora_paths", type=str, default=None, nargs="+")
     parser.add_argument("--lora_weights", type=float, default=None, nargs="+")
     parser.add_argument("--offload", action="store_true")
+    parser.add_argument(
+        "--offload_conditioning",
+        action="store_true",
+        help="Offload diffusion only while building camera/conditioning tensors, then restore it for denoising.",
+    )
+    parser.add_argument(
+        "--offload_vae",
+        action="store_true",
+        help="Offload diffusion only around VAE encode/decode stages, without moving AR history tensors to CPU.",
+    )
+    parser.add_argument(
+        "--pinned_diffusion_offload",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use pinned CPU staging buffers for diffusion offload/restore instead of plain module.to(cpu/cuda).",
+    )
+    parser.add_argument(
+        "--diffusion_offload_gb",
+        type=float,
+        default=0.0,
+        help="When >0, offload only enough tail WAN blocks to free roughly this many GiB. Implies --pinned_diffusion_offload.",
+    )
+    parser.add_argument(
+        "--diffusion_offload_strategy",
+        type=str,
+        default="tail_blocks",
+        choices=["tail_blocks", "full_net"],
+        help="Pinned diffusion offload selection strategy.",
+    )
+    parser.add_argument(
+        "--diffusion_offload_async_restore",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Restore pinned diffusion weights on a dedicated CUDA stream and wait before denoising.",
+    )
     parser.add_argument("--offload_when_prompt", action="store_true")
     parser.add_argument(
         "--low_vram",
         action="store_true",
         help="Enable conservative memory defaults: model/VAE offload, prompt offload, DA3 offload, and smaller warp chunks.",
+    )
+    parser.add_argument(
+        "--hybrid_vram",
+        action="store_true",
+        help="Keep diffusion/VAE resident for faster inference, but offload diffusion for prompt/DA3 to avoid DA3 OOM.",
+    )
+    parser.add_argument(
+        "--merge_lora_for_inference",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Merge active LoRA adapters into base weights after loading. Defaults on for --low_vram and --hybrid_vram.",
     )
     parser.add_argument("--debug", action="store_true")
 
@@ -1030,6 +1091,8 @@ def _apply_low_vram_defaults(args):
     args.offload = True
     args.offload_when_prompt = True
     args.offload_da3_diffusion = True
+    if args.merge_lora_for_inference is None:
+        args.merge_lora_for_inference = True
     if args.warp_chunk_size is None:
         args.warp_chunk_size = 2
     log.info(
@@ -1039,8 +1102,175 @@ def _apply_low_vram_defaults(args):
     )
 
 
+def _apply_hybrid_vram_defaults(args):
+    if not getattr(args, "hybrid_vram", False):
+        return
+    args.offload_when_prompt = True
+    args.offload_da3_diffusion = True
+    if args.merge_lora_for_inference is None:
+        args.merge_lora_for_inference = True
+    if args.warp_chunk_size is None:
+        args.warp_chunk_size = 2
+    log.info(
+        "[hybrid_vram] Enabled: offload=False, offload_when_prompt=True, "
+        f"offload_da3_diffusion=True, merge_lora_for_inference={args.merge_lora_for_inference}, "
+        f"warp_chunk_size={args.warp_chunk_size}",
+        rank0_only=True,
+    )
+
+
+def _tilelang_wan_stats_enabled(args) -> bool:
+    return bool(
+        getattr(args, "tilelang_mlp", False)
+        or getattr(args, "tilelang_attention_norm", False)
+        or getattr(args, "tilelang_modulated_norm", False)
+        or getattr(args, "tilelang_gated_residual", False)
+    )
+
+
+def _reset_tilelang_wan_stats(args) -> None:
+    if not _tilelang_wan_stats_enabled(args):
+        return
+    try:
+        from lyra_2._src.kernels.wan_tilelang_ops import reset_tilelang_wan_stats
+
+        reset_tilelang_wan_stats()
+    except Exception as exc:
+        log.warning(f"[TileLang] Could not reset WAN op stats: {type(exc).__name__}: {exc}", rank0_only=True)
+
+
+def _log_tilelang_wan_stats(args, label: str) -> None:
+    if not _tilelang_wan_stats_enabled(args):
+        return
+    try:
+        from lyra_2._src.kernels.wan_tilelang_ops import get_tilelang_wan_stats
+
+        stats = get_tilelang_wan_stats()
+    except Exception as exc:
+        log.warning(f"[TileLang] Could not read WAN op stats: {type(exc).__name__}: {exc}", rank0_only=True)
+        return
+
+    log.info(
+        "[TileLang] WAN op stats "
+        f"({label}): gelu_calls={stats['gelu_calls']}, "
+        f"gelu_elements={stats['gelu_elements']}, "
+        f"gelu_fallback_calls={stats['gelu_fallback_calls']}, "
+        f"gelu_fallback_elements={stats['gelu_fallback_elements']}, "
+        f"rmsnorm_calls={stats['rmsnorm_calls']}, "
+        f"rmsnorm_shared_input_calls={stats['rmsnorm_shared_input_calls']}, "
+        f"rmsnorm_elements={stats['rmsnorm_elements']}, "
+        f"layernorm_mod_calls={stats['layernorm_mod_calls']}, "
+        f"layernorm_mod_elements={stats['layernorm_mod_elements']}, "
+        f"gated_residual_calls={stats['gated_residual_calls']}, "
+        f"gated_residual_elements={stats['gated_residual_elements']}",
+        rank0_only=True,
+    )
+    if getattr(args, "tilelang_mlp", False) and stats["gelu_calls"] == 0:
+        log.warning("[TileLang] --tilelang_mlp was set but no GELU kernels were executed.", rank0_only=True)
+    if getattr(args, "tilelang_attention_norm", False) and stats["rmsnorm_calls"] == 0:
+        log.warning(
+            "[TileLang] --tilelang_attention_norm was set but no RMSNorm kernels were executed.",
+            rank0_only=True,
+        )
+    if getattr(args, "tilelang_modulated_norm", False) and stats["layernorm_mod_calls"] == 0:
+        log.warning(
+            "[TileLang] --tilelang_modulated_norm was set but no modulated LayerNorm kernels were executed.",
+            rank0_only=True,
+        )
+    if getattr(args, "tilelang_gated_residual", False) and stats["gated_residual_calls"] == 0:
+        log.warning(
+            "[TileLang] --tilelang_gated_residual was set but no gated residual kernels were executed.",
+            rank0_only=True,
+        )
+
+
+def _reset_wan_profile_stats(args) -> None:
+    if not getattr(args, "profile_wan", False):
+        return
+    try:
+        from lyra_2._src.networks.wan2pt1 import reset_wan_profile_stats
+
+        reset_wan_profile_stats()
+    except Exception as exc:
+        log.warning(f"[WAN profile] Could not reset stats: {type(exc).__name__}: {exc}", rank0_only=True)
+
+
+def _reset_ar_profile_stats(args) -> None:
+    if not getattr(args, "profile_wan", False):
+        return
+    try:
+        from lyra_2._src.inference.lyra2_ar_inference import reset_ar_profile_stats
+
+        reset_ar_profile_stats()
+    except Exception as exc:
+        log.warning(f"[AR profile] Could not reset stats: {type(exc).__name__}: {exc}", rank0_only=True)
+
+
+def _log_wan_profile_stats(args, label: str) -> None:
+    if not getattr(args, "profile_wan", False):
+        return
+    try:
+        from lyra_2._src.networks.wan2pt1 import get_wan_profile_stats
+
+        stats = get_wan_profile_stats()
+    except Exception as exc:
+        log.warning(f"[WAN profile] Could not read stats: {type(exc).__name__}: {exc}", rank0_only=True)
+        return
+    if not stats:
+        log.warning("[WAN profile] No stats were collected.", rank0_only=True)
+        return
+
+    total_ms = sum(float(item["ms"]) for item in stats.values())
+    log.info(f"[WAN profile] Section timings ({label}); synchronized timing adds overhead.", rank0_only=True)
+    for name, item in sorted(stats.items(), key=lambda kv: float(kv[1]["ms"]), reverse=True):
+        calls = int(item["calls"])
+        ms = float(item["ms"])
+        avg = ms / max(calls, 1)
+        pct = (100.0 * ms / total_ms) if total_ms > 0 else 0.0
+        log.info(
+            f"[WAN profile] {name}: total_ms={ms:.3f}, calls={calls}, avg_ms={avg:.3f}, share={pct:.1f}%",
+            rank0_only=True,
+        )
+
+
+def _log_ar_profile_stats(args, label: str) -> None:
+    if not getattr(args, "profile_wan", False):
+        return
+    try:
+        from lyra_2._src.inference.lyra2_ar_inference import get_ar_profile_stats
+
+        stats = get_ar_profile_stats()
+    except Exception as exc:
+        log.warning(f"[AR profile] Could not read stats: {type(exc).__name__}: {exc}", rank0_only=True)
+        return
+    if not stats:
+        log.warning("[AR profile] No stats were collected.", rank0_only=True)
+        return
+
+    total_ms = sum(float(item["ms"]) for item in stats.values())
+    log.info(f"[AR profile] Stage timings ({label}); synchronized timing adds overhead.", rank0_only=True)
+    for name, item in sorted(stats.items(), key=lambda kv: float(kv[1]["ms"]), reverse=True):
+        calls = int(item["calls"])
+        ms = float(item["ms"])
+        avg = ms / max(calls, 1)
+        pct = (100.0 * ms / total_ms) if total_ms > 0 else 0.0
+        log.info(
+            f"[AR profile] {name}: total_ms={ms:.3f}, calls={calls}, avg_ms={avg:.3f}, share={pct:.1f}%",
+            rank0_only=True,
+        )
+
+
 if __name__ == "__main__":
     args = parse_arguments()
+    if args.tilelang_attention_norm:
+        os.environ["LYRA2_TILELANG_ATTENTION_NORM"] = "1"
+    if args.tilelang_modulated_norm:
+        os.environ["LYRA2_TILELANG_MODULATED_NORM"] = "1"
+    if args.tilelang_gated_residual:
+        os.environ["LYRA2_TILELANG_GATED_RESIDUAL"] = "1"
+    if args.profile_wan:
+        os.environ["LYRA2_PROFILE_WAN"] = "1"
+    _apply_hybrid_vram_defaults(args)
     _apply_low_vram_defaults(args)
     _apply_dmd_defaults(args)
 
@@ -1082,16 +1312,30 @@ if __name__ == "__main__":
         load_ema_to_reg=False,
         experiment_opts=experiment_opts,
     )
+    if args.tilelang_mlp:
+        from lyra_2._src.kernels.wan_tilelang_ops import replace_gelu_with_tilelang
+
+        replaced = replace_gelu_with_tilelang(
+            model.net,
+            min_elements=args.tilelang_mlp_min_elements,
+            block_size=args.tilelang_mlp_block_size,
+        )
+        log.info(f"[TileLang] Replaced {replaced} tanh GELU modules in model.net MLPs.", rank0_only=True)
     if args.lora_paths:
         lora_names = []
         for lora_path in args.lora_paths:
             lora_name = model.load_lora_weights(lora_path)
             lora_names.append(lora_name)
         model.set_weights_and_activate_adapters(lora_names, args.lora_weights)
-        if args.low_vram and hasattr(model, "merge_active_lora_adapters"):
+        merge_lora = bool(
+            args.low_vram
+            or getattr(args, "hybrid_vram", False)
+            or getattr(args, "merge_lora_for_inference", False)
+        )
+        if merge_lora and hasattr(model, "merge_active_lora_adapters"):
             model.merge_active_lora_adapters(lora_names)
-        if args.low_vram:
-            log.info("Skipping selective checkpoint wrappers for low-VRAM inference", rank0_only=True)
+        if args.low_vram or getattr(args, "hybrid_vram", False):
+            log.info("Skipping selective checkpoint wrappers for VRAM-optimized inference", rank0_only=True)
         elif hasattr(model, "net") and hasattr(model.net, "enable_selective_checkpoint"):
             model.net.enable_selective_checkpoint(model.net.sac_config, model.net.blocks)
 
@@ -1106,6 +1350,7 @@ if __name__ == "__main__":
     assert not getattr(model.config, "use_hd_map_cond", False)
 
     model.eval()
+    configure_diffusion_offload(model, args)
     if args.context_parallel_size > 1:
         model.net.enable_context_parallel(process_group)
 
@@ -1545,15 +1790,23 @@ if __name__ == "__main__":
             log.info("=== Generating unbounded streaming video ===", rank0_only=True)
         else:
             log.info(f"=== Generating video ({N} frames) ===", rank0_only=True)
-        result = run_lyra2_sample(
-            model,
-            data_batch,
-            args,
-            process_group=process_group,
-            da3_model=da3_model,
-            show_progress=True,
-            log_prefix=f"{base_name}_custom_traj",
-        )
+        _reset_tilelang_wan_stats(args)
+        _reset_wan_profile_stats(args)
+        _reset_ar_profile_stats(args)
+        try:
+            result = run_lyra2_sample(
+                model,
+                data_batch,
+                args,
+                process_group=process_group,
+                da3_model=da3_model,
+                show_progress=True,
+                log_prefix=f"{base_name}_custom_traj",
+            )
+        finally:
+            _log_tilelang_wan_stats(args, base_name)
+            _log_wan_profile_stats(args, base_name)
+            _log_ar_profile_stats(args, base_name)
 
         if result is None:
             log.warning(f"Generation failed for {img_path}", rank0_only=True)

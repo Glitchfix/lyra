@@ -17,6 +17,9 @@
 # from Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 
 import math
+import os
+import weakref
+from collections import defaultdict
 from typing import Optional
 
 import torch
@@ -49,6 +52,50 @@ FIRST_LAST_FRAME_CONTEXT_TOKEN_NUMBER = 257 * 2
 from collections import namedtuple
 
 VideoSize = namedtuple("VideoSize", ["T", "H", "W"])
+_ROPE_COS_SIN_CACHE = {}
+_ROPE_COS_SIN_CACHE_MAX = 8
+_WAN_PROFILE_STATS = defaultdict(lambda: {"calls": 0, "ms": 0.0})
+
+
+def wan_profile_enabled() -> bool:
+    return (
+        not torch.is_grad_enabled()
+        and os.environ.get("LYRA2_PROFILE_WAN", "0") == "1"
+        and torch.cuda.is_available()
+    )
+
+
+def reset_wan_profile_stats() -> None:
+    _WAN_PROFILE_STATS.clear()
+
+
+def get_wan_profile_stats() -> dict[str, dict[str, float]]:
+    return {key: {"calls": value["calls"], "ms": value["ms"]} for key, value in _WAN_PROFILE_STATS.items()}
+
+
+class wan_profile_section:
+    def __init__(self, name: str):
+        self.name = name
+        self.active = False
+        self.start = None
+        self.end = None
+
+    def __enter__(self):
+        self.active = wan_profile_enabled()
+        if self.active:
+            self.start = torch.cuda.Event(enable_timing=True)
+            self.end = torch.cuda.Event(enable_timing=True)
+            self.start.record()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.active:
+            self.end.record()
+            self.end.synchronize()
+            stats = _WAN_PROFILE_STATS[self.name]
+            stats["calls"] += 1
+            stats["ms"] += float(self.start.elapsed_time(self.end))
+        return False
 
 
 class VideoPositionEmb(nn.Module):
@@ -200,6 +247,50 @@ def sinusoidal_embedding_1d(dim, position):
     return x
 
 
+def _rope_cos_sin(freqs: torch.Tensor, seq_len: int, head_dim: int, dtype: torch.dtype):
+    owner = freqs
+    freqs = freqs.view(seq_len, head_dim // 2)
+    if torch.is_grad_enabled() or not freqs.is_cuda or os.environ.get("LYRA2_DISABLE_ROPE_CACHE", "0") == "1":
+        return torch.cos(freqs).to(dtype), torch.sin(freqs).to(dtype)
+
+    try:
+        version = int(getattr(freqs, "_version", 0))
+    except RuntimeError:
+        version = 0
+    key = (
+        int(id(owner)),
+        int(freqs.data_ptr()),
+        int(freqs.storage_offset()),
+        version,
+        int(freqs.device.index or 0),
+        str(dtype),
+        int(seq_len),
+        int(head_dim),
+        int(freqs.shape[-1]),
+    )
+    cached = _ROPE_COS_SIN_CACHE.get(key)
+    if cached is not None:
+        owner_ref, cos, sin = cached
+        if owner_ref is not None and owner_ref() is not owner:
+            _ROPE_COS_SIN_CACHE.pop(key)
+        else:
+            _ROPE_COS_SIN_CACHE.pop(key)
+            _ROPE_COS_SIN_CACHE[key] = cached
+            return cos, sin
+
+    try:
+        owner_ref = weakref.ref(owner)
+    except TypeError:
+        owner_ref = None
+
+    cos = torch.cos(freqs).to(dtype)
+    sin = torch.sin(freqs).to(dtype)
+    _ROPE_COS_SIN_CACHE[key] = (owner_ref, cos, sin)
+    while len(_ROPE_COS_SIN_CACHE) > _ROPE_COS_SIN_CACHE_MAX:
+        _ROPE_COS_SIN_CACHE.pop(next(iter(_ROPE_COS_SIN_CACHE)))
+    return cos, sin
+
+
 def rope_apply(x, video_size: VideoSize, freqs):
     """
     Optimized version of rope_apply using flash_attention's rotary embedding implementation.
@@ -223,13 +314,17 @@ def rope_apply(x, video_size: VideoSize, freqs):
     assert seq_len == curr_seq_len, "Sequence length must be equal to T*H*W"
 
     rotary_dtype = x.dtype if not torch.is_grad_enabled() and x.is_cuda else torch.float32
-    freqs = freqs.view(seq_len, head_dim // 2)
-    cos = torch.cos(freqs).to(rotary_dtype)
-    sin = torch.sin(freqs).to(rotary_dtype)
+    cos, sin = _rope_cos_sin(freqs, seq_len, head_dim, rotary_dtype)
 
     # Apply the rotation
     rotary_x = x if x.dtype == rotary_dtype else x.to(rotary_dtype)
-    rotated = flash_apply_rotary_emb(rotary_x, cos, sin, interleaved=True, inplace=False)
+    rotated = flash_apply_rotary_emb(
+        rotary_x,
+        cos,
+        sin,
+        interleaved=True,
+        inplace=not torch.is_grad_enabled() and rotary_x.is_cuda,
+    )
 
     return rotated.to(x.dtype)
 
@@ -249,6 +344,18 @@ class WanRMSNorm(nn.Module):
         Args:
             x(Tensor): Shape [B, L, C]
         """
+        if (
+            not torch.is_grad_enabled()
+            and os.environ.get("LYRA2_TILELANG_ATTENTION_NORM", "0") == "1"
+            and x.is_cuda
+            and x.is_contiguous()
+        ):
+            try:
+                from lyra_2._src.kernels.wan_tilelang_ops import rmsnorm_tilelang
+
+                return rmsnorm_tilelang(x, self.weight, self.eps)
+            except Exception:
+                pass
         if not torch.is_grad_enabled() and x.is_cuda and x.numel() > 32_000_000:
             out = torch.empty_like(x)
             flat_x = x.reshape(-1, x.shape[-1])
@@ -276,6 +383,45 @@ class WanLayerNorm(nn.LayerNorm):
         """
         # return super().forward(x.float()).type_as(x)
         return super().forward(x)
+
+
+def modulated_layernorm_inference(x: torch.Tensor, norm: nn.Module, scale_delta: torch.Tensor, shift: torch.Tensor):
+    if (
+        not torch.is_grad_enabled()
+        and os.environ.get("LYRA2_TILELANG_MODULATED_NORM", "0") == "1"
+        and isinstance(norm, WanLayerNorm)
+        and not norm.elementwise_affine
+        and x.is_cuda
+        and x.is_contiguous()
+    ):
+        try:
+            from lyra_2._src.kernels.wan_tilelang_ops import layernorm_mod_tilelang
+
+            return layernorm_mod_tilelang(x, scale_delta, shift, norm.eps)
+        except Exception:
+            pass
+    return (norm(x).float() * (1 + scale_delta) + shift).type_as(x)
+
+
+def gated_residual_add_inference(x: torch.Tensor, y: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    if (
+        not torch.is_grad_enabled()
+        and os.environ.get("LYRA2_TILELANG_GATED_RESIDUAL", "0") == "1"
+        and x.is_cuda
+        and y.is_cuda
+        and x.is_contiguous()
+        and y.is_contiguous()
+        and x.shape == y.shape
+    ):
+        try:
+            from lyra_2._src.kernels.wan_tilelang_ops import gated_residual_add_tilelang
+
+            return gated_residual_add_tilelang(x, y, gate)
+        except Exception:
+            pass
+    y.mul_(gate.type_as(y))
+    x.add_(y)
+    return x
 
 
 class SelfAttnOp(DotProductAttention):
@@ -345,25 +491,32 @@ class WanSelfAttention(nn.Module):
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
-        x_kq = x if kq_bias is None else x + kq_bias
+        with wan_profile_section("self_attn.kq_bias"):
+            x_kq = x if kq_bias is None else x + kq_bias
         if kq_bias is not None and not torch.is_grad_enabled():
             del kq_bias
 
-        q = self.norm_q(self.q(x_kq)).view(b, s, n, d)
-        k = self.norm_k(self.k(x_kq)).view(b, s, n, d)
+        with wan_profile_section("self_attn.q_proj_norm"):
+            q = self.norm_q(self.q(x_kq)).view(b, s, n, d)
+        with wan_profile_section("self_attn.k_proj_norm"):
+            k = self.norm_k(self.k(x_kq)).view(b, s, n, d)
         if x_kq is not x and not torch.is_grad_enabled():
             del x_kq
-        v = self.v(x).view(b, s, n, d)
+        with wan_profile_section("self_attn.v_proj"):
+            v = self.v(x).view(b, s, n, d)
 
-        q = rope_apply(q, video_size, freqs)
-        k = rope_apply(k, video_size, freqs)
-        x = self.attn_op(q, k, v, video_size)
+        with wan_profile_section("self_attn.rope"):
+            q = rope_apply(q, video_size, freqs)
+            k = rope_apply(k, video_size, freqs)
+        with wan_profile_section("self_attn.dot"):
+            x = self.attn_op(q, k, v, video_size)
         if not torch.is_grad_enabled():
             del q, k, v
 
         # output
         x = x.flatten(2)
-        x = self.o(x)
+        with wan_profile_section("self_attn.out_proj"):
+            x = self.o(x)
         return x
 
     def set_context_parallel_group(self, process_group, ranks, stream):
@@ -381,17 +534,22 @@ class WanT2VCrossAttention(WanSelfAttention):
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
         # compute query, key, value
-        q = self.norm_q(self.q(x)).view(b, -1, n, d)
-        k = self.norm_k(self.k(context)).view(b, -1, n, d)
-        v = self.v(context).view(b, -1, n, d)
+        with wan_profile_section("cross_attn.q_proj_norm"):
+            q = self.norm_q(self.q(x)).view(b, -1, n, d)
+        with wan_profile_section("cross_attn.k_proj_norm"):
+            k = self.norm_k(self.k(context)).view(b, -1, n, d)
+        with wan_profile_section("cross_attn.v_proj"):
+            v = self.v(context).view(b, -1, n, d)
 
         # compute attention
-        x = self.attn_op(q, k, v, None)
+        with wan_profile_section("cross_attn.dot"):
+            x = self.attn_op(q, k, v, None)
         if not torch.is_grad_enabled():
             del q, k, v
         # output
         x = x.flatten(2)
-        x = self.o(x)
+        with wan_profile_section("cross_attn.out_proj"):
+            x = self.o(x)
         return x
 
 
@@ -436,19 +594,24 @@ class WanI2VCrossAttention(WanSelfAttention):
         context = context[:, image_context_length:]
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
-        q = self.norm_q(self.q(x)).view(b, -1, n, d)
+        with wan_profile_section("cross_attn.q_proj_norm"):
+            q = self.norm_q(self.q(x)).view(b, -1, n, d)
 
         if not torch.is_grad_enabled():
-            k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
-            v_img = self.v_img(context_img).view(b, -1, n, d)
+            with wan_profile_section("cross_attn.image_kv_proj_norm"):
+                k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
+                v_img = self.v_img(context_img).view(b, -1, n, d)
             del context_img
-            img_x = self.attn_op_image(q, k_img, v_img)
+            with wan_profile_section("cross_attn.image_dot"):
+                img_x = self.attn_op_image(q, k_img, v_img)
             del k_img, v_img
 
-            k = self.norm_k(self.k(context)).view(b, -1, n, d)
-            v = self.v(context).view(b, -1, n, d)
+            with wan_profile_section("cross_attn.text_kv_proj_norm"):
+                k = self.norm_k(self.k(context)).view(b, -1, n, d)
+                v = self.v(context).view(b, -1, n, d)
             del context
-            x = self.attn_op(q, k, v)
+            with wan_profile_section("cross_attn.text_dot"):
+                x = self.attn_op(q, k, v)
             del q, k, v
         else:
             k = self.norm_k(self.k(context)).view(b, -1, n, d)
@@ -466,7 +629,8 @@ class WanI2VCrossAttention(WanSelfAttention):
             del img_x
         else:
             x = x + img_x
-        x = self.o(x)
+        with wan_profile_section("cross_attn.out_proj"):
+            x = self.o(x)
         return x
 
 
@@ -562,10 +726,9 @@ class WanAttentionBlock(nn.Module):
         assert e[0].dtype == torch.float32
 
         # self-attention
-        y = self.self_attn((self.norm1(x).float() * (1 + e[1]) + e[0]).type_as(x), seq_lens, video_size, freqs)
+        y = self.self_attn(modulated_layernorm_inference(x, self.norm1, e[1], e[0]), seq_lens, video_size, freqs)
         if not torch.is_grad_enabled():
-            y.mul_(e[2].type_as(y))
-            x.add_(y)
+            gated_residual_add_inference(x, y, e[2])
             del y
         else:
             with amp.autocast("cuda", dtype=torch.float32):
@@ -579,10 +742,9 @@ class WanAttentionBlock(nn.Module):
                 del y
             else:
                 x = x + y
-            y = self._forward_ffn((self.norm2(x).float() * (1 + e[4]) + e[3]).type_as(x))
+            y = self._forward_ffn(modulated_layernorm_inference(x, self.norm2, e[4], e[3]))
             if not torch.is_grad_enabled():
-                y.mul_(e[5].type_as(y))
-                x.add_(y)
+                gated_residual_add_inference(x, y, e[5])
                 del y
             else:
                 with amp.autocast("cuda", dtype=torch.float32):
